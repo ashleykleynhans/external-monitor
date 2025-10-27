@@ -1,0 +1,8 @@
+# Discord webhook URL (Slack-compatible format)
+webhook_url: "https://discord.com/api/webhooks/your/webhook/url"
+
+# List of URLs to monitor
+urls:
+  - "https://example.com"
+  - "https://www.google.com"
+  - "https://api.github.com"
