@@ -11,9 +11,15 @@ import ssl
 import requests
 import yaml
 import logging
+import sys
+import os
+import signal
+import argparse
+import atexit
 from datetime import datetime
 from typing import List, Dict, Optional
 from urllib.parse import urlparse
+from pathlib import Path
 
 # Configure logging
 logging.basicConfig(
@@ -24,6 +30,128 @@ logger = logging.getLogger(__name__)
 
 # Check interval in seconds (2 minutes)
 CHECK_INTERVAL = 120
+
+# Daemon configuration
+PID_FILE = "/tmp/url_monitor.pid"
+LOG_FILE = "/tmp/url_monitor.log"
+
+# Global flag for graceful shutdown
+shutdown_requested = False
+
+
+def signal_handler(signum, frame):
+    """Handle shutdown signals gracefully."""
+    global shutdown_requested
+    logger.info(f"Received signal {signum}, initiating graceful shutdown...")
+    shutdown_requested = True
+
+
+def write_pid_file(pid_file: str):
+    """Write the process ID to a PID file."""
+    pid = os.getpid()
+    try:
+        with open(pid_file, 'w') as f:
+            f.write(str(pid))
+        logger.info(f"PID {pid} written to {pid_file}")
+    except Exception as e:
+        logger.error(f"Failed to write PID file: {e}")
+        raise
+
+
+def remove_pid_file(pid_file: str):
+    """Remove the PID file."""
+    try:
+        if os.path.exists(pid_file):
+            os.remove(pid_file)
+            logger.info(f"Removed PID file {pid_file}")
+    except Exception as e:
+        logger.error(f"Failed to remove PID file: {e}")
+
+
+def read_pid_file(pid_file: str) -> Optional[int]:
+    """Read the PID from the PID file."""
+    try:
+        if os.path.exists(pid_file):
+            with open(pid_file, 'r') as f:
+                return int(f.read().strip())
+    except Exception as e:
+        logger.error(f"Failed to read PID file: {e}")
+    return None
+
+
+def is_process_running(pid: int) -> bool:
+    """Check if a process with the given PID is running."""
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def daemonize(pid_file: str, log_file: str):
+    """
+    Daemonize the current process using double-fork method.
+    """
+    # Check if daemon is already running
+    pid = read_pid_file(pid_file)
+    if pid and is_process_running(pid):
+        logger.error(f"Daemon is already running with PID {pid}")
+        sys.exit(1)
+
+    # First fork
+    try:
+        pid = os.fork()
+        if pid > 0:
+            # Parent process, exit
+            sys.exit(0)
+    except OSError as e:
+        logger.error(f"First fork failed: {e}")
+        sys.exit(1)
+
+    # Decouple from parent environment
+    os.chdir('/')
+    os.setsid()
+    os.umask(0)
+
+    # Second fork
+    try:
+        pid = os.fork()
+        if pid > 0:
+            # Parent process, exit
+            sys.exit(0)
+    except OSError as e:
+        logger.error(f"Second fork failed: {e}")
+        sys.exit(1)
+
+    # Redirect standard file descriptors
+    sys.stdout.flush()
+    sys.stderr.flush()
+
+    # Reopen stdin, stdout, stderr
+    si = open(os.devnull, 'r')
+    so = open(log_file, 'a+')
+    se = open(log_file, 'a+')
+
+    os.dup2(si.fileno(), sys.stdin.fileno())
+    os.dup2(so.fileno(), sys.stdout.fileno())
+    os.dup2(se.fileno(), sys.stderr.fileno())
+
+    # Reconfigure logging to use file handler
+    for handler in logger.handlers[:]:
+        logger.removeHandler(handler)
+
+    file_handler = logging.FileHandler(log_file)
+    file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+    logger.addHandler(file_handler)
+    logger.setLevel(logging.INFO)
+
+    # Write PID file
+    write_pid_file(pid_file)
+
+    # Register cleanup function
+    atexit.register(remove_pid_file, pid_file)
+
+    logger.info("Daemon started successfully")
 
 
 class URLMonitor:
@@ -192,27 +320,148 @@ class URLMonitor:
 
     def run(self):
         """Run the monitoring loop continuously."""
+        global shutdown_requested
+
+        # Set up signal handlers
+        signal.signal(signal.SIGTERM, signal_handler)
+        signal.signal(signal.SIGINT, signal_handler)
+
         logger.info(f"Starting monitoring loop (check every {CHECK_INTERVAL}s)...")
 
-        while True:
+        while not shutdown_requested:
             try:
                 self.monitor_once()
             except Exception as e:
                 logger.error(f"Error in monitoring loop: {e}")
 
-            time.sleep(CHECK_INTERVAL)
+            # Sleep in small increments to allow for responsive shutdown
+            for _ in range(CHECK_INTERVAL):
+                if shutdown_requested:
+                    break
+                time.sleep(1)
+
+        logger.info("Monitoring loop stopped gracefully")
+
+
+def stop_daemon(pid_file: str):
+    """Stop the daemon process."""
+    pid = read_pid_file(pid_file)
+    if not pid:
+        print("No PID file found. Daemon may not be running.")
+        return False
+
+    if not is_process_running(pid):
+        print(f"Process {pid} is not running. Cleaning up PID file.")
+        remove_pid_file(pid_file)
+        return False
+
+    # Send SIGTERM to gracefully shut down
+    try:
+        print(f"Stopping daemon with PID {pid}...")
+        os.kill(pid, signal.SIGTERM)
+
+        # Wait for process to terminate
+        for _ in range(30):  # Wait up to 30 seconds
+            if not is_process_running(pid):
+                print("Daemon stopped successfully.")
+                remove_pid_file(pid_file)
+                return True
+            time.sleep(1)
+
+        # If still running, force kill
+        print("Daemon did not stop gracefully, forcing shutdown...")
+        os.kill(pid, signal.SIGKILL)
+        time.sleep(1)
+        remove_pid_file(pid_file)
+        print("Daemon stopped forcefully.")
+        return True
+
+    except Exception as e:
+        print(f"Error stopping daemon: {e}")
+        return False
+
+
+def status_daemon(pid_file: str):
+    """Check the status of the daemon."""
+    pid = read_pid_file(pid_file)
+    if not pid:
+        print("Daemon is not running (no PID file found).")
+        return False
+
+    if is_process_running(pid):
+        print(f"Daemon is running with PID {pid}.")
+        return True
+    else:
+        print(f"PID file exists but process {pid} is not running.")
+        remove_pid_file(pid_file)
+        return False
 
 
 def main():
     """Main entry point."""
-    try:
-        monitor = URLMonitor()
-        monitor.run()
-    except KeyboardInterrupt:
-        logger.info("Monitoring stopped by user")
-    except Exception as e:
-        logger.error(f"Fatal error: {e}")
-        raise
+    parser = argparse.ArgumentParser(description='URL Monitor Daemon')
+    parser.add_argument(
+        'command',
+        choices=['start', 'stop', 'restart', 'status', 'foreground'],
+        help='Command to execute'
+    )
+    parser.add_argument(
+        '--config',
+        default='config.yml',
+        help='Path to configuration file (default: config.yml)'
+    )
+    parser.add_argument(
+        '--pid-file',
+        default=PID_FILE,
+        help=f'Path to PID file (default: {PID_FILE})'
+    )
+    parser.add_argument(
+        '--log-file',
+        default=LOG_FILE,
+        help=f'Path to log file (default: {LOG_FILE})'
+    )
+
+    args = parser.parse_args()
+
+    if args.command == 'start':
+        print("Starting daemon...")
+        daemonize(args.pid_file, args.log_file)
+        try:
+            monitor = URLMonitor(args.config)
+            monitor.run()
+        except Exception as e:
+            logger.error(f"Fatal error: {e}")
+            raise
+
+    elif args.command == 'stop':
+        stop_daemon(args.pid_file)
+
+    elif args.command == 'restart':
+        print("Restarting daemon...")
+        stop_daemon(args.pid_file)
+        time.sleep(2)
+        print("Starting daemon...")
+        daemonize(args.pid_file, args.log_file)
+        try:
+            monitor = URLMonitor(args.config)
+            monitor.run()
+        except Exception as e:
+            logger.error(f"Fatal error: {e}")
+            raise
+
+    elif args.command == 'status':
+        status_daemon(args.pid_file)
+
+    elif args.command == 'foreground':
+        print("Running in foreground mode (Ctrl+C to stop)...")
+        try:
+            monitor = URLMonitor(args.config)
+            monitor.run()
+        except KeyboardInterrupt:
+            logger.info("Monitoring stopped by user")
+        except Exception as e:
+            logger.error(f"Fatal error: {e}")
+            raise
 
 
 if __name__ == "__main__":

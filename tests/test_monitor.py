@@ -5,30 +5,42 @@ Unit tests for URL Monitor
 import pytest
 import tempfile
 import os
-from unittest.mock import Mock, patch, MagicMock
-from monitor import URLMonitor
+import signal
+import time
+from unittest.mock import Mock, patch, MagicMock, mock_open
+from monitor import (
+    URLMonitor,
+    signal_handler,
+    write_pid_file,
+    remove_pid_file,
+    read_pid_file,
+    is_process_running,
+    stop_daemon,
+    status_daemon
+)
 
 
-class TestURLMonitor:
-    """Test cases for URLMonitor class."""
-
-    @pytest.fixture
-    def config_file(self):
-        """Create a temporary config file for testing."""
-        config_content = """
+@pytest.fixture
+def config_file():
+    """Create a temporary config file for testing."""
+    config_content = """
 webhook_url: "https://discord.com/api/webhooks/test/webhook"
 urls:
   - "https://example.com"
   - "https://test.com"
 """
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.yml', delete=False) as f:
-            f.write(config_content)
-            config_path = f.name
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.yml', delete=False) as f:
+        f.write(config_content)
+        config_path = f.name
 
-        yield config_path
+    yield config_path
 
-        # Cleanup
-        os.unlink(config_path)
+    # Cleanup
+    os.unlink(config_path)
+
+
+class TestURLMonitor:
+    """Test cases for URLMonitor class."""
 
     def test_load_config(self, config_file):
         """Test configuration loading."""
@@ -188,3 +200,125 @@ urls: []
 
         assert result["success"] is False
         assert result["ssl_error"] == "SSL certificate expired"
+
+
+class TestDaemonFunctions:
+    """Test cases for daemon-related functions."""
+
+    def test_write_pid_file(self):
+        """Test writing PID file."""
+        with tempfile.NamedTemporaryFile(delete=False) as f:
+            pid_file = f.name
+
+        try:
+            write_pid_file(pid_file)
+            assert os.path.exists(pid_file)
+
+            with open(pid_file, 'r') as f:
+                pid = int(f.read().strip())
+            assert pid == os.getpid()
+        finally:
+            if os.path.exists(pid_file):
+                os.unlink(pid_file)
+
+    def test_remove_pid_file(self):
+        """Test removing PID file."""
+        with tempfile.NamedTemporaryFile(delete=False) as f:
+            pid_file = f.name
+            f.write(b"12345")
+
+        assert os.path.exists(pid_file)
+        remove_pid_file(pid_file)
+        assert not os.path.exists(pid_file)
+
+    def test_read_pid_file(self):
+        """Test reading PID file."""
+        with tempfile.NamedTemporaryFile(mode='w', delete=False) as f:
+            pid_file = f.name
+            f.write("54321")
+
+        try:
+            pid = read_pid_file(pid_file)
+            assert pid == 54321
+        finally:
+            os.unlink(pid_file)
+
+    def test_read_pid_file_nonexistent(self):
+        """Test reading non-existent PID file."""
+        pid = read_pid_file("/tmp/nonexistent_pid_file.pid")
+        assert pid is None
+
+    def test_is_process_running_current(self):
+        """Test checking if current process is running."""
+        assert is_process_running(os.getpid()) is True
+
+    def test_is_process_running_nonexistent(self):
+        """Test checking if non-existent process is running."""
+        # Use a very high PID that's unlikely to exist
+        assert is_process_running(999999) is False
+
+    @patch('monitor.shutdown_requested', False)
+    def test_signal_handler(self):
+        """Test signal handler sets shutdown flag."""
+        import monitor
+        monitor.shutdown_requested = False
+        signal_handler(signal.SIGTERM, None)
+        assert monitor.shutdown_requested is True
+
+    @patch('monitor.read_pid_file')
+    @patch('monitor.is_process_running')
+    def test_status_daemon_running(self, mock_is_running, mock_read_pid):
+        """Test daemon status when running."""
+        mock_read_pid.return_value = 12345
+        mock_is_running.return_value = True
+
+        result = status_daemon("/tmp/test.pid")
+        assert result is True
+
+    @patch('monitor.read_pid_file')
+    def test_status_daemon_not_running(self, mock_read_pid):
+        """Test daemon status when not running."""
+        mock_read_pid.return_value = None
+
+        result = status_daemon("/tmp/test.pid")
+        assert result is False
+
+    @patch('monitor.read_pid_file')
+    @patch('monitor.is_process_running')
+    @patch('monitor.remove_pid_file')
+    def test_status_daemon_stale_pid(self, mock_remove, mock_is_running, mock_read_pid):
+        """Test daemon status with stale PID file."""
+        mock_read_pid.return_value = 12345
+        mock_is_running.return_value = False
+
+        result = status_daemon("/tmp/test.pid")
+        assert result is False
+        mock_remove.assert_called_once()
+
+    @patch('monitor.URLMonitor.monitor_once')
+    @patch('monitor.time.sleep')
+    def test_run_with_shutdown(self, mock_sleep, mock_monitor_once, config_file):
+        """Test that run method respects shutdown flag."""
+        import monitor
+        monitor.shutdown_requested = False
+
+        # Create a side effect that sets shutdown after first call
+        def set_shutdown(*args):
+            monitor.shutdown_requested = True
+
+        mock_monitor_once.side_effect = set_shutdown
+
+        url_monitor = URLMonitor(config_file)
+        url_monitor.run()
+
+        # Should have called monitor_once at least once
+        assert mock_monitor_once.called
+
+    @patch('monitor.read_pid_file')
+    @patch('monitor.is_process_running')
+    def test_stop_daemon_not_running(self, mock_is_running, mock_read_pid):
+        """Test stopping daemon that's not running."""
+        mock_read_pid.return_value = None
+
+        result = stop_daemon("/tmp/test.pid")
+        assert result is False
