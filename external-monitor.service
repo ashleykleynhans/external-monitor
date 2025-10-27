@@ -1,0 +1,29 @@
+[Unit]
+Description=External Monitor Service
+Documentation=https://github.com/ashleykleynhans/external-monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=monitor
+Group=monitor
+WorkingDirectory=/opt/external-monitor
+ExecStart=/opt/external-monitor/venv/bin/python /opt/external-monitor/monitor.py foreground --config /opt/external-monitor/config.yml
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/log/external-monitor
+
+# Environment
+Environment="PYTHONUNBUFFERED=1"
+
+[Install]
+WantedBy=multi-user.target

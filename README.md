@@ -1,6 +1,7 @@
 # External Monitor
 
-A Python-based URL monitoring tool that checks the health and SSL certificate validity of configured endpoints at regular intervals and sends notifications to Discord via webhooks.
+A Python-based URL monitoring tool that checks the health and SSL certificate validity of
+configured endpoints at regular intervals and sends notifications to Discord via webhooks.
 
 ## Features
 
@@ -110,6 +111,97 @@ When running in daemon mode, logs are written to the log file:
 tail -f /tmp/url_monitor.log
 ```
 
+## Systemd Service Installation (Linux)
+
+For production deployments on Linux systems with systemd, you can install the monitor as a system service.
+
+### Installation Steps
+
+1. **Create a dedicated user for the service:**
+   ```bash
+   sudo useradd -r -s /bin/false monitor
+   ```
+
+2. **Clone the repository to /opt:**
+   ```bash
+   cd /opt
+   sudo git clone https://github.com/ashleykleynhans/external-monitor.git
+   ```
+
+3. **Create and configure the virtual environment:**
+   ```bash
+   cd /opt/external-monitor
+   sudo python3 -m venv venv
+   sudo venv/bin/pip install -r requirements.txt
+   ```
+
+4. **Configure the monitor:**
+   ```bash
+   sudo cp config.yml.example config.yml
+   sudo nano config.yml  # Edit with your URLs and webhook
+   ```
+
+5. **Set proper ownership:**
+   ```bash
+   sudo chown -R monitor:monitor /opt/external-monitor
+   ```
+
+6. **Install and enable the systemd service:**
+   ```bash
+   sudo cp /opt/external-monitor/external-monitor.service /etc/systemd/system/
+   sudo systemctl daemon-reload
+   sudo systemctl enable external-monitor
+   sudo systemctl start external-monitor
+   ```
+
+### Managing the Systemd Service
+
+Check service status:
+```bash
+sudo systemctl status external-monitor
+```
+
+Stop the service:
+```bash
+sudo systemctl stop external-monitor
+```
+
+Restart the service:
+```bash
+sudo systemctl restart external-monitor
+```
+
+View logs:
+```bash
+sudo journalctl -u external-monitor -f
+```
+
+View recent logs with timestamps:
+```bash
+sudo journalctl -u external-monitor -n 100 --no-pager
+```
+
+### Customizing the Service
+
+If you need to customize the installation, edit `external-monitor.service` before copying it to `/etc/systemd/system/`:
+
+- **User/Group**: Change `User=monitor` and `Group=monitor` to your preferred user
+- **Installation Path**: Change `/opt/external-monitor` to your desired location
+- **Config Location**: Modify the `--config` flag path
+- **Virtual Environment**: Update the path to the venv Python binary
+
+Example for custom installation path:
+```ini
+WorkingDirectory=/home/myuser/external-monitor
+ExecStart=/home/myuser/external-monitor/venv/bin/python /home/myuser/external-monitor/monitor.py foreground --config /home/myuser/external-monitor/config.yml
+```
+
+After making changes, reload systemd:
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart external-monitor
+```
+
 ## Notifications
 
 The monitoring system will send Discord notifications when:
@@ -179,3 +271,13 @@ rm /tmp/url_monitor.pid
 This project is licensed under the GNU General Public License v3.0 - see the [LICENSE](LICENSE) file for details.
 
 GPLv3 ensures that this software and any derivative works remain free and open source.
+
+
+## Community and Contributing
+
+Pull requests and issues on [GitHub](https://github.com/ashleykleynhans/ipset)
+are welcome. Bug fixes and new features are encouraged.
+
+## Appreciate my work?
+
+<a href="https://www.buymeacoffee.com/ashleyk" target="_blank"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" style="height: 60px !important;width: 217px !important;" ></a>
