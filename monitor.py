@@ -436,6 +436,10 @@ def main():
 
     args = parser.parse_args()
 
+    # Convert config path to absolute path before daemonizing
+    # (daemon changes working directory to /)
+    args.config = os.path.abspath(args.config)
+
     if args.command == 'start':
         print("Starting daemon...")
         daemonize(args.pid_file, args.log_file)
