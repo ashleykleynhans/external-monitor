@@ -574,6 +574,9 @@ def main():
         except Exception as e:
             logger.error(f"Fatal error: {e}")
             raise
+    else:  # pragma: no cover
+        # This should never happen due to argparse choices constraint
+        pass
 
 
 if __name__ == "__main__":
