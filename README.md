@@ -7,7 +7,10 @@ configured endpoints at regular intervals and sends alerts to Alertmanager via w
 
 - Monitor multiple URLs at configurable intervals (default: 2 minutes)
 - SSL certificate validation
-- HTTP status code checking
+- HTTP status code checking with automatic redirect following
+- Alert deduplication - alerts only sent on state changes (OK→FAIL, FAIL→OK)
+- Resolved alerts sent automatically when URLs recover
+- State persistence across daemon restarts
 - Alertmanager-compatible webhook notifications
 - Automatic severity classification (critical for 5xx/SSL errors, warning for 4xx)
 - Hostname tracking to identify which server is performing the monitoring
@@ -23,9 +26,17 @@ configured endpoints at regular intervals and sends alerts to Alertmanager via w
 ## Installation
 
 1. Clone this repository
+   ```bash
+   mkdir -p /opt
+   cd /opt
+   git clone https://github.com/ashleykleynhans/external-monitor.git
+   ```
 2. Install dependencies:
    ```bash
-   pip install -r requirements.txt
+   cd external-monitor
+   python3 -m venv venv
+   source venv/bin/activate
+   pip3 install -r requirements.txt
    ```
 
 3. Copy and configure the config file:
@@ -254,6 +265,36 @@ Alerts are sent to `{webhook_url}/{severity}` (e.g., `/alert/critical` or `/aler
 ```
 
 This is sent as a POST request to the webhook URL with the severity appended (e.g., `https://your-webhook.com/alert/critical`).
+
+### Alert State Management and Deduplication
+
+The monitor implements intelligent alert deduplication to prevent alert fatigue:
+
+**State Tracking:**
+- The monitor maintains a persistent state file (`/tmp/url_monitor_state.json`) that tracks the current status of each URL
+- State persists across daemon restarts, ensuring consistent behavior
+
+**Alert Behavior:**
+- **First Failure**: When a URL transitions from OK to FAIL, a "firing" alert is sent immediately
+- **Continued Failure**: If a URL remains down, no additional alerts are sent (prevents spam)
+- **Recovery**: When a URL transitions from FAIL to OK, a "resolved" alert is sent automatically
+- **Subsequent Checks**: Once recovered, the URL must fail again to trigger a new "firing" alert
+
+**HTTP Redirect Handling:**
+- The monitor automatically follows HTTP redirects (301, 302, etc.)
+- The final status code after following redirects is evaluated
+- Only a final status of 200 is considered successful
+
+**State File Location:**
+- Default: `/tmp/url_monitor_state.json`
+- Contains URL status, severity level, and timestamp of first failure
+- Automatically created and managed by the monitor
+
+This ensures that:
+1. You're notified immediately when a service goes down
+2. You're not spammed with repeated alerts while it's down
+3. You're notified when the service recovers
+4. Alert history survives daemon restarts
 
 ## Testing
 
