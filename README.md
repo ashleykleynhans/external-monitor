@@ -8,10 +8,12 @@ configured endpoints at regular intervals and sends alerts to Alertmanager via w
 - Monitor multiple URLs at configurable intervals (default: 2 minutes)
 - SSL certificate validation
 - HTTP status code checking with automatic redirect following
+- Health check thresholds with automatic retries (5 failures before alerting, 2 successes for recovery)
 - Alert deduplication - alerts only sent on state changes (OK→FAIL, FAIL→OK)
 - Resolved alerts sent automatically when URLs recover
 - State persistence across daemon restarts
 - Alertmanager-compatible webhook notifications
+- PagerDuty backup notifications (automatic failover when Alertmanager is down)
 - Automatic severity classification (critical for 5xx/SSL errors, warning for 4xx)
 - Hostname tracking to identify which server is performing the monitoring
 - Daemon mode for running as a background service
