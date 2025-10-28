@@ -19,7 +19,7 @@ StandardError=journal
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/tmp /var/log/external-monitor
+ReadWritePaths=/tmp
 
 # Environment
 Environment="PYTHONUNBUFFERED=1"
