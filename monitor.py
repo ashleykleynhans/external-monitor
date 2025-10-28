@@ -443,13 +443,8 @@ class URLMonitor:
                 # Reset success counter
                 consecutive_successes = 0
 
-                # If we just completed all retries and still failed, set to threshold
-                # This means FAILURE_THRESHOLD attempts failed within this single cycle
-                if retry_count == FAILURE_THRESHOLD:
-                    consecutive_failures = FAILURE_THRESHOLD
-                else:
-                    # Shouldn't happen with current logic, but keep for safety
-                    consecutive_failures += 1
+                # After retry loop, all FAILURE_THRESHOLD attempts failed
+                consecutive_failures = FAILURE_THRESHOLD
 
                 # Determine severity for state tracking
                 severity = "critical"
@@ -460,8 +455,8 @@ class URLMonitor:
                 elif result.get("status_code") and result["status_code"] >= 400:
                     severity = "warning"
 
-                # Check if we should send a firing alert
-                if not is_alerted and consecutive_failures >= FAILURE_THRESHOLD:
+                # Send alert if not already alerted
+                if not is_alerted:
                     logger.warning(f"URL failed {consecutive_failures} consecutive times, sending alert: {url}")
                     self.send_discord_notification(url, result, status="firing")
                     self.state[url] = {
@@ -470,14 +465,6 @@ class URLMonitor:
                         "alerted": True,
                         "severity": severity,
                         "first_failure": datetime.now().isoformat()
-                    }
-                elif not is_alerted:
-                    logger.info(f"URL failing ({consecutive_failures}/{FAILURE_THRESHOLD} before alert): {url}")
-                    self.state[url] = {
-                        "consecutive_failures": consecutive_failures,
-                        "consecutive_successes": 0,
-                        "alerted": False,
-                        "severity": severity
                     }
                 else:
                     # Already alerted, just track failures
