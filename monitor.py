@@ -261,7 +261,7 @@ class URLMonitor:
         # Check HTTP response (SSL validation handled by requests library)
         try:
             headers = {
-                'User-Agent': 'External Monitor v0.0.1'
+                'User-Agent': 'External Monitoring Tool; ExternalMonitor/v0.0.1; +https://github.com/ashleykleynhans/external-monitor'
             }
             response = requests.get(url, timeout=10, verify=True, allow_redirects=True, headers=headers)
             result["status_code"] = response.status_code
