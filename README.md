@@ -228,26 +228,32 @@ Alerts are sent in Alertmanager webhook format with:
 
 ### Example Alert Payload
 
+Alerts are sent to `{webhook_url}/{severity}` (e.g., `/alert/critical` or `/alert/warning`):
+
 ```json
-[
-  {
-    "labels": {
-      "alertname": "URLMonitorAlert",
-      "severity": "critical",
-      "url": "https://example.com",
-      "instance": "monitor-server-1",
-      "service": "external-monitor",
-      "status_code": "500"
-    },
-    "annotations": {
-      "summary": "URL Monitor Alert: https://example.com is down or unreachable",
-      "description": "Internal Server Error"
-    },
-    "startsAt": "2025-10-28T10:30:00Z",
-    "generatorURL": "http://monitor-server-1/external-monitor"
-  }
-]
+{
+  "alerts": [
+    {
+      "labels": {
+        "alertname": "URLMonitorAlert",
+        "severity": "critical",
+        "url": "https://example.com",
+        "instance": "monitor-server-1",
+        "service": "external-monitor",
+        "status_code": "500"
+      },
+      "annotations": {
+        "summary": "URL Monitor Alert: https://example.com is down or unreachable",
+        "description": "Internal Server Error"
+      },
+      "startsAt": "2025-10-28T10:30:00Z",
+      "generatorURL": "http://monitor-server-1/external-monitor"
+    }
+  ]
+}
 ```
+
+This is sent as a POST request to the webhook URL with the severity appended (e.g., `https://your-webhook.com/alert/critical`).
 
 ## Testing
 
