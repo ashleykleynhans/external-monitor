@@ -147,7 +147,8 @@ urls: []
         # Verify webhook was called
         assert mock_post.called
         call_args = mock_post.call_args
-        assert monitor.webhook_url in call_args[0]
+        # Webhook URL should have /critical appended for 500 errors
+        assert f"{monitor.webhook_url}/critical" == call_args[0][0]
 
         # Verify payload structure (Alertmanager format)
         payload = call_args[1]['json']

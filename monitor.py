@@ -308,10 +308,13 @@ class URLMonitor:
         # Alertmanager expects an array of alerts
         payload = [alert]
 
+        # Append severity to webhook URL (e.g., /alert/critical or /alert/warning)
+        webhook_url = f"{self.webhook_url.rstrip('/')}/{severity}"
+
         try:
-            logger.debug(f"Sending webhook payload: {payload}")
+            logger.debug(f"Sending webhook payload to {webhook_url}: {payload}")
             response = requests.post(
-                self.webhook_url,
+                webhook_url,
                 json=payload,
                 timeout=10
             )
