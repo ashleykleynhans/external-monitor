@@ -733,6 +733,22 @@ class TestMainFunction:
         mock_monitor_class.assert_called_once()
         mock_monitor.run.assert_called_once()
 
+    @patch('sys.argv', ['monitor.py', 'foreground', '--config', 'config.yml'])
+    @patch('monitor.URLMonitor')
+    def test_main_foreground_normal_exit(self, mock_monitor_class):
+        """Test main foreground with normal exit."""
+        from monitor import main
+
+        mock_monitor = MagicMock()
+        mock_monitor.run.return_value = None  # Normal completion
+        mock_monitor_class.return_value = mock_monitor
+
+        with patch('os.path.abspath', return_value='/abs/path/config.yml'):
+            main()
+
+        mock_monitor_class.assert_called_once()
+        mock_monitor.run.assert_called_once()
+
     @patch('sys.argv', ['monitor.py', 'status'])
     @patch('monitor.status_daemon')
     def test_main_status(self, mock_status):
