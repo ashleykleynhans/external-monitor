@@ -627,11 +627,12 @@ class TestMonitorOnce:
         mock_notify.assert_not_called()
         mock_save.assert_called_once()
 
+    @patch('monitor.time.sleep')  # Mock sleep to avoid delays
     @patch('monitor.URLMonitor.check_url')
     @patch('monitor.URLMonitor.send_discord_notification')
     @patch('monitor.URLMonitor._save_state')
-    def test_monitor_once_with_failure(self, mock_save, mock_notify, mock_check, config_file, state_file):
-        """Test monitor_once with one URL failing (first time failure)."""
+    def test_monitor_once_with_failure(self, mock_save, mock_notify, mock_check, mock_sleep, config_file, state_file):
+        """Test monitor_once with one URL failing all retries (triggers alert)."""
         monitor = URLMonitor(config_file, state_file)
 
         def check_side_effect(url):
@@ -653,8 +654,16 @@ class TestMonitorOnce:
 
         monitor.monitor_once()
 
-        assert mock_check.call_count == 2
+        # example.com: 1 initial + 4 retries = 5 checks
+        # test.com: 1 check
+        # Total: 6 checks
+        assert mock_check.call_count == 6
+
+        # Should send alert after 5 consecutive failures
         assert mock_notify.call_count == 1
+
+        # Verify alert was firing (not resolved)
+        assert mock_notify.call_args[1]['status'] == 'firing'
 
 
 class TestDaemonErrorPaths:
@@ -982,12 +991,13 @@ class TestStopDaemonForcedKill:
 
 
 class TestStateManagement:
-    """Test cases for alert state management."""
+    """Test cases for alert state management with thresholds."""
 
+    @patch('monitor.time.sleep')  # Mock sleep to avoid delays
     @patch('monitor.URLMonitor.check_url')
     @patch('monitor.URLMonitor.send_discord_notification')
-    def test_first_failure_sends_firing_alert(self, mock_notify, mock_check, config_file, state_file):
-        """Test that first failure sends a firing alert."""
+    def test_failure_only_alerts_after_threshold(self, mock_notify, mock_check, mock_sleep, config_file, state_file):
+        """Test that alert is only sent after FAILURE_THRESHOLD (5) consecutive failures."""
         monitor = URLMonitor(config_file, state_file)
 
         # Simulate a failure
@@ -1000,19 +1010,20 @@ class TestStateManagement:
 
         monitor.monitor_once()
 
-        # Should have sent firing alert for both URLs (new failures)
+        # Should have sent firing alert for both URLs after 5 retries each
         assert mock_notify.call_count == 2
         # Check that status="firing" was used
         for call in mock_notify.call_args_list:
             assert call[1]['status'] == 'firing'
 
+    @patch('monitor.time.sleep')  # Mock sleep to avoid delays
     @patch('monitor.URLMonitor.check_url')
     @patch('monitor.URLMonitor.send_discord_notification')
-    def test_continued_failure_no_alert(self, mock_notify, mock_check, config_file, state_file):
-        """Test that continued failures don't send additional alerts."""
+    def test_continued_failure_no_additional_alert(self, mock_notify, mock_check, mock_sleep, config_file, state_file):
+        """Test that continued failures after alert don't send additional alerts."""
         monitor = URLMonitor(config_file, state_file)
 
-        # First failure
+        # First check - fails 5 times, triggers alert
         mock_check.return_value = {
             "success": False,
             "status_code": 500,
@@ -1023,18 +1034,19 @@ class TestStateManagement:
         monitor.monitor_once()
         assert mock_notify.call_count == 2  # Both URLs fail, both send alerts
 
-        # Second failure (should not send alerts)
+        # Second check - still failing (no additional alerts)
         mock_notify.reset_mock()
         monitor.monitor_once()
-        assert mock_notify.call_count == 0  # No alerts sent
+        assert mock_notify.call_count == 0  # No additional alerts sent
 
+    @patch('monitor.time.sleep')  # Mock sleep to avoid delays
     @patch('monitor.URLMonitor.check_url')
     @patch('monitor.URLMonitor.send_discord_notification')
-    def test_recovery_sends_resolved_alert(self, mock_notify, mock_check, config_file, state_file):
-        """Test that recovery from failure sends a resolved alert."""
+    def test_recovery_requires_threshold(self, mock_notify, mock_check, mock_sleep, config_file, state_file):
+        """Test that recovery requires RECOVERY_THRESHOLD (2) consecutive successes."""
         monitor = URLMonitor(config_file, state_file)
 
-        # First failure
+        # First check - fails and triggers alert
         mock_check.return_value = {
             "success": False,
             "status_code": 500,
@@ -1045,7 +1057,7 @@ class TestStateManagement:
         monitor.monitor_once()
         assert mock_notify.call_count == 2  # Firing alerts
 
-        # Recovery
+        # First success - not enough for recovery
         mock_notify.reset_mock()
         mock_check.return_value = {
             "success": True,
@@ -1055,14 +1067,19 @@ class TestStateManagement:
         }
 
         monitor.monitor_once()
-        assert mock_notify.call_count == 2  # Resolved alerts
+        assert mock_notify.call_count == 0  # No resolved alerts yet (need 2 successes)
+
+        # Second success - triggers resolved alert
+        monitor.monitor_once()
+        assert mock_notify.call_count == 2  # Resolved alerts sent
         # Check that status="resolved" was used
         for call in mock_notify.call_args_list:
             assert call[1]['status'] == 'resolved'
 
+    @patch('monitor.time.sleep')  # Mock sleep to avoid delays
     @patch('monitor.URLMonitor.check_url')
     @patch('monitor.URLMonitor.send_discord_notification')
-    def test_state_persists_between_checks(self, mock_notify, mock_check, config_file, state_file):
+    def test_state_persists_between_checks(self, mock_notify, mock_check, mock_sleep, config_file, state_file):
         """Test that state persists to file and can be reloaded."""
         # First monitor instance - create failing state
         monitor1 = URLMonitor(config_file, state_file)
@@ -1080,7 +1097,7 @@ class TestStateManagement:
         mock_notify.reset_mock()
         monitor2 = URLMonitor(config_file, state_file)
 
-        # URL still failing - should not send alert
+        # URL still failing - should not send alert (already alerted)
         monitor2.monitor_once()
         assert mock_notify.call_count == 0  # No new alerts
 
@@ -1093,9 +1110,11 @@ class TestStateManagement:
         mock_response.status_code = 200
         mock_post.return_value = mock_response
 
-        # Set up state with a critical failure
+        # Set up state with a critical failure (new structure)
         monitor.state["https://example.com"] = {
-            "failing": True,
+            "alerted": True,
+            "consecutive_failures": 5,
+            "consecutive_successes": 0,
             "severity": "critical",
             "first_failure": "2025-10-28T10:00:00"
         }
@@ -1119,9 +1138,11 @@ class TestStateManagement:
         mock_response.status_code = 200
         mock_post.return_value = mock_response
 
-        # Set up state
+        # Set up state (new structure)
         monitor.state["https://example.com"] = {
-            "failing": True,
+            "alerted": True,
+            "consecutive_failures": 5,
+            "consecutive_successes": 0,
             "severity": "warning",
             "first_failure": "2025-10-28T10:00:00"
         }
@@ -1173,17 +1194,24 @@ class TestStateManagement:
     @patch('json.dump', side_effect=IOError("Disk full"))
     def test_state_file_save_exception(self, mock_dump, config_file, state_file):
         """Test that exceptions during state save are handled gracefully."""
-        # Create monitor with state
+        # Create monitor with state (new structure)
         monitor = URLMonitor(config_file, state_file)
-        monitor.state = {"https://example.com": {"failing": True}}
+        monitor.state = {
+            "https://example.com": {
+                "alerted": True,
+                "consecutive_failures": 5,
+                "consecutive_successes": 0
+            }
+        }
 
         # Should not raise an exception
         monitor._save_state()
 
+    @patch('monitor.time.sleep')  # Mock sleep to avoid delays
     @patch('monitor.URLMonitor.check_url')
     @patch('monitor.URLMonitor.send_discord_notification')
-    def test_first_failure_with_ssl_error(self, mock_notify, mock_check, config_file, state_file):
-        """Test first failure with SSL error sets critical severity."""
+    def test_failure_with_ssl_error_sets_critical(self, mock_notify, mock_check, mock_sleep, config_file, state_file):
+        """Test failure with SSL error sets critical severity."""
         monitor = URLMonitor(config_file, state_file)
 
         # Simulate an SSL error
@@ -1196,16 +1224,18 @@ class TestStateManagement:
 
         monitor.monitor_once()
 
-        # Should have sent firing alert
+        # Should have sent firing alert after 5 failures
         assert mock_notify.call_count == 2
         # Check that state has critical severity
         for url in monitor.urls:
             assert monitor.state[url]["severity"] == "critical"
+            assert monitor.state[url]["alerted"] is True
 
+    @patch('monitor.time.sleep')  # Mock sleep to avoid delays
     @patch('monitor.URLMonitor.check_url')
     @patch('monitor.URLMonitor.send_discord_notification')
-    def test_first_failure_with_4xx_error(self, mock_notify, mock_check, config_file, state_file):
-        """Test first failure with 4xx error sets warning severity."""
+    def test_failure_with_4xx_error_sets_warning(self, mock_notify, mock_check, mock_sleep, config_file, state_file):
+        """Test failure with 4xx error sets warning severity."""
         monitor = URLMonitor(config_file, state_file)
 
         # Simulate a 404 error
@@ -1218,16 +1248,18 @@ class TestStateManagement:
 
         monitor.monitor_once()
 
-        # Should have sent firing alert
+        # Should have sent firing alert after 5 failures
         assert mock_notify.call_count == 2
         # Check that state has warning severity
         for url in monitor.urls:
             assert monitor.state[url]["severity"] == "warning"
+            assert monitor.state[url]["alerted"] is True
 
+    @patch('monitor.time.sleep')  # Mock sleep to avoid delays
     @patch('monitor.URLMonitor.check_url')
     @patch('monitor.URLMonitor.send_discord_notification')
-    def test_first_failure_with_3xx_error(self, mock_notify, mock_check, config_file, state_file):
-        """Test first failure with 3xx error stays as critical severity (default)."""
+    def test_failure_with_3xx_error_sets_critical(self, mock_notify, mock_check, mock_sleep, config_file, state_file):
+        """Test failure with 3xx error sets critical severity (default)."""
         monitor = URLMonitor(config_file, state_file)
 
         # Simulate a 301 redirect error
@@ -1240,11 +1272,12 @@ class TestStateManagement:
 
         monitor.monitor_once()
 
-        # Should have sent firing alert
+        # Should have sent firing alert after 5 failures
         assert mock_notify.call_count == 2
         # Check that state has critical severity (default when not 4xx or 5xx)
         for url in monitor.urls:
             assert monitor.state[url]["severity"] == "critical"
+            assert monitor.state[url]["alerted"] is True
 
 
 class TestRedirectHandling:

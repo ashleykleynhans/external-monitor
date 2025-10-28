@@ -45,6 +45,11 @@ logger = logging.getLogger(__name__)
 # Check interval in seconds (2 minutes)
 CHECK_INTERVAL = 120
 
+# Health check thresholds
+FAILURE_THRESHOLD = 5  # Number of consecutive failures before alerting
+RECOVERY_THRESHOLD = 2  # Number of consecutive successes before resolving
+RETRY_INTERVAL = 5  # Seconds between retries for failed checks
+
 # Daemon configuration
 PID_FILE = "/tmp/url_monitor.pid"
 LOG_FILE = "/tmp/url_monitor.log"
@@ -378,47 +383,112 @@ class URLMonitor:
             logger.error(f"Error sending notification: {e}")
 
     def monitor_once(self):
-        """Perform one monitoring check of all URLs."""
+        """Perform one monitoring check of all URLs with retry logic and thresholds."""
         logger.info("Starting monitoring check...")
 
         for url in self.urls:
-            result = self.check_url(url)
+            # Get previous state
             previous_state = self.state.get(url, {})
-            was_failing = previous_state.get("failing", False)
+            consecutive_failures = previous_state.get("consecutive_failures", 0)
+            consecutive_successes = previous_state.get("consecutive_successes", 0)
+            is_alerted = previous_state.get("alerted", False)
+
+            # Perform initial check
+            result = self.check_url(url)
+            retry_count = 1  # Track number of attempts made
+
+            # If initial check fails, retry up to FAILURE_THRESHOLD times
+            if not result["success"]:
+                while retry_count < FAILURE_THRESHOLD and not result["success"]:
+                    logger.info(f"Retry {retry_count}/{FAILURE_THRESHOLD-1} for {url} in {RETRY_INTERVAL}s...")
+                    time.sleep(RETRY_INTERVAL)
+                    result = self.check_url(url)
+                    retry_count += 1
 
             if result["success"]:
                 logger.info(f"OK: {url} (HTTP {result['status_code']})")
 
-                # If it was failing before, send a resolved alert
-                if was_failing:
-                    logger.info(f"URL recovered: {url}")
+                # Reset failure counter, increment success counter
+                consecutive_failures = 0
+                consecutive_successes += 1
+
+                # Check if we should send a resolved alert
+                if is_alerted and consecutive_successes >= RECOVERY_THRESHOLD:
+                    logger.info(f"URL recovered after {consecutive_successes} successful checks: {url}")
                     self.send_discord_notification(url, {}, status="resolved")
-                    # Remove from state or mark as not failing
-                    self.state[url] = {"failing": False}
+                    # Mark as no longer alerted
+                    self.state[url] = {
+                        "consecutive_failures": 0,
+                        "consecutive_successes": consecutive_successes,
+                        "alerted": False
+                    }
+                elif is_alerted:
+                    logger.info(f"URL passing ({consecutive_successes}/{RECOVERY_THRESHOLD} needed for recovery): {url}")
+                    self.state[url] = {
+                        "consecutive_failures": 0,
+                        "consecutive_successes": consecutive_successes,
+                        "alerted": True,
+                        "severity": previous_state.get("severity", "critical")
+                    }
+                else:
+                    # Just update state without alert
+                    self.state[url] = {
+                        "consecutive_failures": 0,
+                        "consecutive_successes": consecutive_successes,
+                        "alerted": False
+                    }
             else:
-                logger.warning(f"FAIL: {url}")
+                logger.warning(f"FAIL: {url} - {result.get('error', 'Unknown error')}")
 
-                # Only send alert if this is a new failure (state change)
-                if not was_failing:
-                    logger.info(f"New failure detected: {url}")
+                # Reset success counter
+                consecutive_successes = 0
 
-                    # Determine severity for state tracking
+                # If we just completed all retries and still failed, set to threshold
+                # This means FAILURE_THRESHOLD attempts failed within this single cycle
+                if retry_count == FAILURE_THRESHOLD:
+                    consecutive_failures = FAILURE_THRESHOLD
+                else:
+                    # Shouldn't happen with current logic, but keep for safety
+                    consecutive_failures += 1
+
+                # Determine severity for state tracking
+                severity = "critical"
+                if result.get("ssl_error"):
                     severity = "critical"
-                    if result.get("ssl_error"):
-                        severity = "critical"
-                    elif result.get("status_code") and result["status_code"] >= 500:
-                        severity = "critical"
-                    elif result.get("status_code") and result["status_code"] >= 400:
-                        severity = "warning"
+                elif result.get("status_code") and result["status_code"] >= 500:
+                    severity = "critical"
+                elif result.get("status_code") and result["status_code"] >= 400:
+                    severity = "warning"
 
+                # Check if we should send a firing alert
+                if not is_alerted and consecutive_failures >= FAILURE_THRESHOLD:
+                    logger.warning(f"URL failed {consecutive_failures} consecutive times, sending alert: {url}")
                     self.send_discord_notification(url, result, status="firing")
                     self.state[url] = {
-                        "failing": True,
+                        "consecutive_failures": consecutive_failures,
+                        "consecutive_successes": 0,
+                        "alerted": True,
                         "severity": severity,
                         "first_failure": datetime.now().isoformat()
                     }
+                elif not is_alerted:
+                    logger.info(f"URL failing ({consecutive_failures}/{FAILURE_THRESHOLD} before alert): {url}")
+                    self.state[url] = {
+                        "consecutive_failures": consecutive_failures,
+                        "consecutive_successes": 0,
+                        "alerted": False,
+                        "severity": severity
+                    }
                 else:
-                    logger.debug(f"URL still failing (no alert sent): {url}")
+                    # Already alerted, just track failures
+                    logger.debug(f"URL still failing (already alerted): {url}")
+                    self.state[url] = {
+                        "consecutive_failures": consecutive_failures,
+                        "consecutive_successes": 0,
+                        "alerted": True,
+                        "severity": severity,
+                        "first_failure": previous_state.get("first_failure", datetime.now().isoformat())
+                    }
 
         # Save state after processing all URLs
         self._save_state()
