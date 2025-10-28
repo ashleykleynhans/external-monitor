@@ -8,6 +8,7 @@ import os
 import signal
 import time
 import requests
+import yaml
 from unittest.mock import Mock, patch, MagicMock, mock_open
 from monitor import (
     URLMonitor,
@@ -1315,3 +1316,280 @@ class TestRedirectHandling:
 
         assert result['success'] is True
         assert result['status_code'] == 200
+
+class TestPagerDutyIntegration:
+    """Test PagerDuty backup notification functionality."""
+
+    @patch('requests.post')
+    def test_pagerduty_alert_firing(self, mock_post, config_file):
+        """Test sending a firing alert to PagerDuty."""
+        # Create config with PagerDuty key
+        with open(config_file, 'r') as f:
+            config = yaml.safe_load(f)
+        config['pagerduty_integration_key'] = 'test_key_12345'
+        with open(config_file, 'w') as f:
+            yaml.dump(config, f)
+
+        monitor = URLMonitor(config_file)
+
+        # Mock successful PagerDuty response
+        mock_response = Mock()
+        mock_response.status_code = 202
+        mock_post.return_value = mock_response
+
+        error_details = {
+            "error": "Internal Server Error",
+            "status_code": 500,
+            "ssl_error": None
+        }
+
+        result = monitor.send_pagerduty_alert(
+            "https://example.com",
+            error_details,
+            "critical",
+            "firing"
+        )
+
+        assert result is True
+        assert mock_post.called
+        call_args = mock_post.call_args
+        assert call_args[0][0] == "https://events.pagerduty.com/v2/enqueue"
+
+        payload = call_args[1]['json']
+        assert payload['routing_key'] == 'test_key_12345'
+        assert payload['event_action'] == 'trigger'
+        assert payload['dedup_key'] == 'external-monitor-https://example.com'
+        assert payload['payload']['severity'] == 'critical'
+        assert payload['payload']['source'] == monitor.hostname
+
+    @patch('requests.post')
+    def test_pagerduty_alert_resolved(self, mock_post, config_file):
+        """Test sending a resolved alert to PagerDuty."""
+        # Create config with PagerDuty key
+        with open(config_file, 'r') as f:
+            config = yaml.safe_load(f)
+        config['pagerduty_integration_key'] = 'test_key_12345'
+        with open(config_file, 'w') as f:
+            yaml.dump(config, f)
+
+        monitor = URLMonitor(config_file)
+
+        # Mock successful PagerDuty response
+        mock_response = Mock()
+        mock_response.status_code = 202
+        mock_post.return_value = mock_response
+
+        result = monitor.send_pagerduty_alert(
+            "https://example.com",
+            {},
+            "critical",
+            "resolved"
+        )
+
+        assert result is True
+        payload = mock_post.call_args[1]['json']
+        assert payload['event_action'] == 'resolve'
+
+    def test_pagerduty_without_key(self, config_file):
+        """Test PagerDuty alert when no key is configured."""
+        monitor = URLMonitor(config_file)
+
+        result = monitor.send_pagerduty_alert(
+            "https://example.com",
+            {"error": "Test"},
+            "critical",
+            "firing"
+        )
+
+        assert result is False
+
+    @patch('requests.post')
+    def test_pagerduty_api_error(self, mock_post, config_file):
+        """Test PagerDuty API returning error status."""
+        # Create config with PagerDuty key
+        with open(config_file, 'r') as f:
+            config = yaml.safe_load(f)
+        config['pagerduty_integration_key'] = 'test_key_12345'
+        with open(config_file, 'w') as f:
+            yaml.dump(config, f)
+
+        monitor = URLMonitor(config_file)
+
+        # Mock error response
+        mock_response = Mock()
+        mock_response.status_code = 400
+        mock_response.text = "Invalid request"
+        mock_post.return_value = mock_response
+
+        result = monitor.send_pagerduty_alert(
+            "https://example.com",
+            {"error": "Test"},
+            "critical",
+            "firing"
+        )
+
+        assert result is False
+
+    @patch('requests.post')
+    def test_pagerduty_connection_error(self, mock_post, config_file):
+        """Test PagerDuty API connection exception."""
+        # Create config with PagerDuty key
+        with open(config_file, 'r') as f:
+            config = yaml.safe_load(f)
+        config['pagerduty_integration_key'] = 'test_key_12345'
+        with open(config_file, 'w') as f:
+            yaml.dump(config, f)
+
+        monitor = URLMonitor(config_file)
+
+        # Mock connection error
+        mock_post.side_effect = requests.exceptions.ConnectionError("Connection refused")
+
+        result = monitor.send_pagerduty_alert(
+            "https://example.com",
+            {"error": "Test"},
+            "critical",
+            "firing"
+        )
+
+        assert result is False
+
+    @patch('requests.post')
+    def test_alertmanager_failure_triggers_pagerduty(self, mock_post, config_file):
+        """Test that Alertmanager failure triggers PagerDuty backup."""
+        # Create config with PagerDuty key
+        with open(config_file, 'r') as f:
+            config = yaml.safe_load(f)
+        config['pagerduty_integration_key'] = 'test_key_12345'
+        with open(config_file, 'w') as f:
+            yaml.dump(config, f)
+
+        monitor = URLMonitor(config_file)
+
+        # First call to Alertmanager fails, second call to PagerDuty succeeds
+        alertmanager_response = Mock()
+        alertmanager_response.status_code = 500
+        alertmanager_response.text = "Internal Server Error"
+
+        pagerduty_response = Mock()
+        pagerduty_response.status_code = 202
+
+        mock_post.side_effect = [alertmanager_response, pagerduty_response]
+
+        error_details = {
+            "error": "Connection timeout",
+            "status_code": None,
+            "ssl_error": None
+        }
+
+        monitor.send_discord_notification("https://example.com", error_details, "firing")
+
+        # Should have called both Alertmanager and PagerDuty
+        assert mock_post.call_count == 2
+
+        # First call to Alertmanager (webhook URL ends with /critical)
+        first_call = mock_post.call_args_list[0]
+        assert first_call[0][0].endswith('/critical')
+
+        # Second call to PagerDuty
+        second_call = mock_post.call_args_list[1]
+        assert second_call[0][0] == "https://events.pagerduty.com/v2/enqueue"
+
+    @patch('requests.post')
+    def test_alertmanager_exception_triggers_pagerduty(self, mock_post, config_file):
+        """Test that Alertmanager exception triggers PagerDuty backup."""
+        # Create config with PagerDuty key
+        with open(config_file, 'r') as f:
+            config = yaml.safe_load(f)
+        config['pagerduty_integration_key'] = 'test_key_12345'
+        with open(config_file, 'w') as f:
+            yaml.dump(config, f)
+
+        monitor = URLMonitor(config_file)
+
+        # First call to Alertmanager raises exception, second call to PagerDuty succeeds
+        pagerduty_response = Mock()
+        pagerduty_response.status_code = 202
+
+        mock_post.side_effect = [
+            requests.exceptions.ConnectionError("Cannot reach Alertmanager"),
+            pagerduty_response
+        ]
+
+        error_details = {
+            "error": "Connection timeout",
+            "status_code": None,
+            "ssl_error": None
+        }
+
+        monitor.send_discord_notification("https://example.com", error_details, "firing")
+
+        # Should have called both Alertmanager and PagerDuty
+        assert mock_post.call_count == 2
+
+        # Second call should be to PagerDuty
+        second_call = mock_post.call_args_list[1]
+        assert second_call[0][0] == "https://events.pagerduty.com/v2/enqueue"
+
+    @patch('requests.post')
+    def test_alertmanager_success_skips_pagerduty(self, mock_post, config_file):
+        """Test that successful Alertmanager call does not trigger PagerDuty."""
+        # Create config with PagerDuty key
+        with open(config_file, 'r') as f:
+            config = yaml.safe_load(f)
+        config['pagerduty_integration_key'] = 'test_key_12345'
+        with open(config_file, 'w') as f:
+            yaml.dump(config, f)
+
+        monitor = URLMonitor(config_file)
+
+        # Alertmanager succeeds
+        alertmanager_response = Mock()
+        alertmanager_response.status_code = 200
+        mock_post.return_value = alertmanager_response
+
+        error_details = {
+            "error": "Connection timeout",
+            "status_code": None,
+            "ssl_error": None
+        }
+
+        monitor.send_discord_notification("https://example.com", error_details, "firing")
+
+        # Should only call Alertmanager, not PagerDuty
+        assert mock_post.call_count == 1
+        assert mock_post.call_args[0][0].endswith('/critical')
+
+    @patch('requests.post')
+    def test_pagerduty_alert_with_ssl_error(self, mock_post, config_file):
+        """Test PagerDuty alert with SSL error details."""
+        # Create config with PagerDuty key
+        with open(config_file, 'r') as f:
+            config = yaml.safe_load(f)
+        config['pagerduty_integration_key'] = 'test_key_12345'
+        with open(config_file, 'w') as f:
+            yaml.dump(config, f)
+
+        monitor = URLMonitor(config_file)
+
+        # Mock successful PagerDuty response
+        mock_response = Mock()
+        mock_response.status_code = 202
+        mock_post.return_value = mock_response
+
+        error_details = {
+            "error": "Connection failed",
+            "status_code": None,
+            "ssl_error": "Certificate has expired"
+        }
+
+        result = monitor.send_pagerduty_alert(
+            "https://example.com",
+            error_details,
+            "critical",
+            "firing"
+        )
+
+        assert result is True
+        payload = mock_post.call_args[1]['json']
+        assert payload['payload']['custom_details']['ssl_error'] == "Certificate has expired"

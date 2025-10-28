@@ -50,16 +50,34 @@ configured endpoints at regular intervals and sends alerts to Alertmanager via w
 
 Edit `config.yml` to specify:
 
-- `webhook_url`: Your Alertmanager webhook URL
+- `webhook_url`: Your Alertmanager webhook URL (required)
+- `pagerduty_integration_key`: Your PagerDuty Events API v2 integration key (optional - used as backup)
 - `urls`: List of URLs to monitor
 
 Example:
 ```yaml
 webhook_url: "https://your-alertmanager.com/api/v1/alerts"
+pagerduty_integration_key: "your-pagerduty-integration-key"  # Optional backup
 urls:
   - "https://example.com"
   - "https://api.example.com"
 ```
+
+### PagerDuty Backup Notifications (Optional)
+
+The monitor supports PagerDuty as a backup notification system. If the Alertmanager webhook is unreachable or returns an error, alerts will automatically be sent to PagerDuty instead.
+
+To enable PagerDuty backup:
+1. Create a service in PagerDuty
+2. Add an "Events API v2" integration to your service
+3. Copy the integration key
+4. Add the key to `config.yml` as `pagerduty_integration_key`
+
+When enabled, the monitor will:
+- Try sending alerts to Alertmanager first
+- If Alertmanager is down or returns an error (4xx/5xx), automatically failover to PagerDuty
+- Send both "trigger" and "resolve" events to PagerDuty
+- Use deduplication keys to ensure alerts are properly grouped
 
 ## Usage
 

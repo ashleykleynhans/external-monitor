@@ -1,6 +1,10 @@
 # Alertmanager webhook URL
 webhook_url: "https://discord.com/api/webhooks/your/webhook/url"
 
+# PagerDuty Integration Key (optional - used as backup if Alertmanager is unavailable)
+# Get this from your PagerDuty service's Integrations tab (Events API v2)
+pagerduty_integration_key: ""
+
 # List of URLs to monitor
 urls:
   - "https://example.com"

@@ -181,6 +181,7 @@ class URLMonitor:
         """Initialize the monitor with configuration."""
         self.config = self._load_config(config_path)
         self.webhook_url = self.config.get("webhook_url")
+        self.pagerduty_key = self.config.get("pagerduty_integration_key")
         self.urls = self.config.get("urls", [])
         self.hostname = socket.gethostname()
         self.state_file = state_file
@@ -193,6 +194,8 @@ class URLMonitor:
 
         logger.info(f"Initialized monitor on host: {self.hostname}")
         logger.info(f"Monitoring {len(self.urls)} URL(s)")
+        if self.pagerduty_key:
+            logger.info("PagerDuty backup notifications enabled")
 
     def _load_config(self, config_path: str) -> Dict:
         """Load configuration from YAML file."""
@@ -291,6 +294,62 @@ class URLMonitor:
 
         return result
 
+    def send_pagerduty_alert(self, url: str, error_details: Dict, severity: str, status: str = "firing"):
+        """Send alert to PagerDuty Events API v2 as backup."""
+        if not self.pagerduty_key:
+            logger.warning("PagerDuty integration key not configured, skipping backup notification")
+            return False
+
+        pagerduty_url = "https://events.pagerduty.com/v2/enqueue"
+
+        # Build description
+        description_parts = []
+        if error_details.get("error"):
+            description_parts.append(error_details['error'])
+        if error_details.get("ssl_error"):
+            description_parts.append(f"SSL: {error_details['ssl_error']}")
+        description = " | ".join(description_parts) if description_parts else "URL is unreachable"
+
+        # Determine event action based on status
+        event_action = "resolve" if status == "resolved" else "trigger"
+
+        # Build PagerDuty Events API v2 payload
+        payload = {
+            "routing_key": self.pagerduty_key,
+            "event_action": event_action,
+            "dedup_key": f"external-monitor-{url}",
+            "payload": {
+                "summary": f"URL Monitor: {url} is {'recovered' if status == 'resolved' else 'down'}",
+                "source": self.hostname,
+                "severity": severity,
+                "custom_details": {
+                    "url": url,
+                    "error": error_details.get("error", ""),
+                    "ssl_error": error_details.get("ssl_error", ""),
+                    "status_code": error_details.get("status_code", ""),
+                    "service": "external-monitor"
+                }
+            }
+        }
+
+        try:
+            logger.info(f"Sending PagerDuty backup notification for {url}")
+            response = requests.post(
+                pagerduty_url,
+                json=payload,
+                timeout=10,
+                headers={"Content-Type": "application/json"}
+            )
+            if response.status_code == 202:
+                logger.info(f"PagerDuty backup notification sent successfully for {url}")
+                return True
+            else:
+                logger.error(f"PagerDuty API error: {response.status_code} - {response.text}")
+                return False
+        except Exception as e:
+            logger.error(f"Error sending PagerDuty notification: {e}")
+            return False
+
     def send_discord_notification(self, url: str, error_details: Dict, status: str = "firing"):
         """Send notification to Alertmanager via webhook."""
         from datetime import datetime, timezone
@@ -379,8 +438,16 @@ class URLMonitor:
                 logger.error(
                     f"Failed to send notification: {response.status_code} - {response.text}"
                 )
+                # Try PagerDuty as backup if primary failed
+                if self.pagerduty_key:
+                    logger.warning(f"Alertmanager returned {response.status_code}, attempting PagerDuty backup")
+                    self.send_pagerduty_alert(url, error_details, severity, status)
         except Exception as e:
-            logger.error(f"Error sending notification: {e}")
+            logger.error(f"Error sending notification to Alertmanager: {e}")
+            # Try PagerDuty as backup if primary failed with exception
+            if self.pagerduty_key:
+                logger.warning("Alertmanager unavailable, attempting PagerDuty backup")
+                self.send_pagerduty_alert(url, error_details, severity, status)
 
     def monitor_once(self):
         """Perform one monitoring check of all URLs with retry logic and thresholds."""
