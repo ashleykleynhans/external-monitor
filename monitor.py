@@ -246,6 +246,7 @@ class URLMonitor:
     def check_url(self, url: str) -> Dict:
         """
         Check a URL for availability and SSL validity.
+        Follows redirects automatically and reports the final status code.
         Returns a dict with status and error information.
         """
         result = {
@@ -267,7 +268,7 @@ class URLMonitor:
 
         # Check HTTP response
         try:
-            response = requests.get(url, timeout=10, verify=True)
+            response = requests.get(url, timeout=10, verify=True, allow_redirects=True)
             result["status_code"] = response.status_code
 
             if response.status_code != 200:

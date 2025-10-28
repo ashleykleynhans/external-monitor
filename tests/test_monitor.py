@@ -1231,3 +1231,40 @@ class TestStateManagement:
         # Check that state has critical severity (default when not 4xx or 5xx)
         for url in monitor.urls:
             assert monitor.state[url]["severity"] == "critical"
+
+
+class TestRedirectHandling:
+    """Test cases for HTTP redirect handling."""
+
+    @patch('requests.get')
+    def test_check_url_follows_redirects(self, mock_get, config_file):
+        """Test that check_url follows redirects."""
+        monitor = URLMonitor(config_file)
+
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_get.return_value = mock_response
+
+        result = monitor.check_url("https://example.com")
+
+        # Verify allow_redirects=True was passed
+        mock_get.assert_called_once()
+        call_kwargs = mock_get.call_args[1]
+        assert call_kwargs['allow_redirects'] is True
+        assert result['success'] is True
+        assert result['status_code'] == 200
+
+    @patch('requests.get')
+    def test_check_url_redirect_to_success(self, mock_get, config_file):
+        """Test URL that redirects to a successful page."""
+        monitor = URLMonitor(config_file)
+
+        # Simulate a redirect chain that ends in 200
+        mock_response = Mock()
+        mock_response.status_code = 200  # Final status after following redirects
+        mock_get.return_value = mock_response
+
+        result = monitor.check_url("https://example.com/old-page")
+
+        assert result['success'] is True
+        assert result['status_code'] == 200
