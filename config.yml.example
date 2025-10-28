@@ -1,4 +1,4 @@
-# Discord webhook URL (Slack-compatible format)
+# Alertmanager webhook URL
 webhook_url: "https://discord.com/api/webhooks/your/webhook/url"
 
 # List of URLs to monitor

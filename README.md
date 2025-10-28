@@ -1,14 +1,15 @@
 # External Monitor
 
 A Python-based URL monitoring tool that checks the health and SSL certificate validity of
-configured endpoints at regular intervals and sends notifications to Discord via webhooks.
+configured endpoints at regular intervals and sends alerts to Alertmanager via webhooks.
 
 ## Features
 
 - Monitor multiple URLs at configurable intervals (default: 2 minutes)
 - SSL certificate validation
 - HTTP status code checking
-- Discord notifications via Slack-compatible webhooks
+- Alertmanager-compatible webhook notifications
+- Automatic severity classification (critical for 5xx/SSL errors, warning for 4xx)
 - Hostname tracking to identify which server is performing the monitoring
 - Daemon mode for running as a background service
 - Graceful shutdown handling
@@ -32,18 +33,18 @@ configured endpoints at regular intervals and sends notifications to Discord via
    cp config.yml.example config.yml
    ```
 
-4. Edit `config.yml` with your URLs and Discord webhook endpoint
+4. Edit `config.yml` with your URLs and Alertmanager webhook endpoint
 
 ## Configuration
 
 Edit `config.yml` to specify:
 
-- `webhook_url`: Your Discord webhook URL (Slack-compatible format)
+- `webhook_url`: Your Alertmanager webhook URL
 - `urls`: List of URLs to monitor
 
 Example:
 ```yaml
-webhook_url: "https://discord.com/api/webhooks/your/webhook/url"
+webhook_url: "https://your-alertmanager.com/api/v1/alerts"
 urls:
   - "https://example.com"
   - "https://api.example.com"
@@ -202,17 +203,51 @@ sudo systemctl daemon-reload
 sudo systemctl restart external-monitor
 ```
 
-## Notifications
+## Alertmanager Notifications
 
-The monitoring system will send Discord notifications when:
+The monitoring system sends Alertmanager-compatible alerts when:
 - A URL returns a non-200 HTTP status code
 - SSL certificate validation fails
 - Connection errors occur
 
-Each notification includes:
-- The affected URL
-- The hostname of the monitoring server
-- Error details
+### Alert Format
+
+Alerts are sent in Alertmanager webhook format with:
+
+**Labels:**
+- `alertname`: "URLMonitorAlert"
+- `severity`: "critical" (5xx/SSL errors) or "warning" (4xx errors)
+- `url`: The failing URL
+- `instance`: Hostname of the monitoring server
+- `service`: "external-monitor"
+- `status_code`: HTTP status code (when available)
+
+**Annotations:**
+- `summary`: Brief alert description
+- `description`: Detailed error information
+
+### Example Alert Payload
+
+```json
+[
+  {
+    "labels": {
+      "alertname": "URLMonitorAlert",
+      "severity": "critical",
+      "url": "https://example.com",
+      "instance": "monitor-server-1",
+      "service": "external-monitor",
+      "status_code": "500"
+    },
+    "annotations": {
+      "summary": "URL Monitor Alert: https://example.com is down or unreachable",
+      "description": "Internal Server Error"
+    },
+    "startsAt": "2025-10-28T10:30:00Z",
+    "generatorURL": "http://monitor-server-1/external-monitor"
+  }
+]
+```
 
 ## Testing
 

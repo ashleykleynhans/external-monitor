@@ -263,69 +263,50 @@ class URLMonitor:
         return result
 
     def send_discord_notification(self, url: str, error_details: Dict):
-        """Send notification to Discord via webhook."""
-        import time
-        timestamp = int(time.time())
+        """Send notification to Alertmanager via webhook."""
+        from datetime import datetime, timezone
 
-        # Build error summary for fallback
-        error_summary = f"**URL Monitor Alert:** {url}\n\n"
-        error_summary += f"**Details:** "
-
+        # Build alert description
+        description_parts = []
         if error_details.get("error"):
-            error_summary += f"{error_details['error']}"
-
-        # Build title with emoji
-        title = ":rotating_light: URL Monitor Alert"
-
-        # Build main text
-        text_parts = [f"*{url}* is down or unreachable"]
-
-        # Build fields for Slack attachment
-        fields = []
-
-        if error_details.get("status_code"):
-            fields.append({
-                "title": "HTTP Status",
-                "value": f"`{error_details['status_code']}`",
-                "short": True
-            })
-
-        fields.append({
-            "title": "Monitored From",
-            "value": f"`{self.hostname}`",
-            "short": True
-        })
-
-        # Add error details as a single formatted field
-        error_messages = []
-        if error_details.get("error"):
-            error_messages.append(f"• {error_details['error']}")
+            description_parts.append(error_details['error'])
         if error_details.get("ssl_error"):
-            error_messages.append(f"• SSL: {error_details['ssl_error']}")
+            description_parts.append(f"SSL: {error_details['ssl_error']}")
 
-        if error_messages:
-            fields.append({
-                "title": "Error Details",
-                "value": "\n".join(error_messages),
-                "short": False
-            })
+        description = " | ".join(description_parts) if description_parts else "URL is unreachable"
 
-        # Slack-compatible webhook payload
-        payload = {
-            "channel": "#alerts-critical-prod",
-            "username": "URL Monitor",
-            "icon_emoji": ":python:",
-            "attachments": [{
-                "fallback": error_summary,
-                "color": "#ff0000",  # Bright red
-                "title": title,
-                "text": "\n".join(text_parts),
-                "fields": fields,
-                "footer": "External Monitor",
-                "footer_icon": "https://platform.slack-edge.com/img/default_application_icon.png",
-                "ts": timestamp
-            }]
+        # Determine severity based on error type
+        severity = "critical"
+        if error_details.get("ssl_error"):
+            severity = "critical"
+        elif error_details.get("status_code") and error_details["status_code"] >= 500:
+            severity = "critical"
+        elif error_details.get("status_code") and error_details["status_code"] >= 400:
+            severity = "warning"
+
+        # Build Alertmanager-compatible payload
+        alert = {
+            "labels": {
+                "alertname": "URLMonitorAlert",
+                "severity": severity,
+                "url": url,
+                "instance": self.hostname,
+                "service": "external-monitor"
+            },
+            "annotations": {
+                "summary": f"URL Monitor Alert: {url} is down or unreachable",
+                "description": description
+            },
+            "startsAt": datetime.now(timezone.utc).isoformat(),
+            "generatorURL": f"http://{self.hostname}/external-monitor"
         }
+
+        # Add status code to labels if available
+        if error_details.get("status_code"):
+            alert["labels"]["status_code"] = str(error_details["status_code"])
+
+        # Alertmanager expects an array of alerts
+        payload = [alert]
 
         try:
             logger.debug(f"Sending webhook payload: {payload}")

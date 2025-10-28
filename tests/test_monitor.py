@@ -128,7 +128,7 @@ urls: []
 
     @patch('monitor.requests.post')
     def test_send_discord_notification(self, mock_post, config_file):
-        """Test Discord notification sending."""
+        """Test Alertmanager notification sending."""
         monitor = URLMonitor(config_file)
 
         # Mock successful webhook post
@@ -149,25 +149,29 @@ urls: []
         call_args = mock_post.call_args
         assert monitor.webhook_url in call_args[0]
 
-        # Verify payload structure (Slack-compatible format)
+        # Verify payload structure (Alertmanager format)
         payload = call_args[1]['json']
-        assert 'attachments' in payload
-        assert len(payload['attachments']) > 0
-        assert 'fields' in payload['attachments'][0]
-        assert payload['attachments'][0]['color'] == '#ff0000'
+        assert isinstance(payload, list)
+        assert len(payload) == 1
 
-        # Verify channel and bot configuration
-        assert payload['channel'] == '#alerts-critical-prod'
-        assert payload['username'] == 'URL Monitor'
-        assert payload['icon_emoji'] == ':python:'
+        alert = payload[0]
+        assert 'labels' in alert
+        assert 'annotations' in alert
+        assert 'startsAt' in alert
+        assert 'generatorURL' in alert
 
-        # Verify attachment has required fields
-        attachment = payload['attachments'][0]
-        assert 'fallback' in attachment
-        assert 'title' in attachment
-        assert 'text' in attachment
-        assert 'footer' in attachment
-        assert 'ts' in attachment
+        # Verify labels
+        assert alert['labels']['alertname'] == 'URLMonitorAlert'
+        assert alert['labels']['severity'] == 'critical'
+        assert alert['labels']['url'] == 'https://example.com'
+        assert alert['labels']['instance'] == monitor.hostname
+        assert alert['labels']['service'] == 'external-monitor'
+        assert alert['labels']['status_code'] == '500'
+
+        # Verify annotations
+        assert 'summary' in alert['annotations']
+        assert 'description' in alert['annotations']
+        assert 'https://example.com' in alert['annotations']['summary']
 
     @patch('monitor.socket.gethostname')
     def test_hostname_included(self, mock_hostname, config_file):
@@ -459,6 +463,11 @@ class TestWebhookNotificationVariations:
         monitor.send_discord_notification("https://example.com", error_details)
         assert mock_post.called
 
+        payload = mock_post.call_args[1]['json']
+        assert isinstance(payload, list)
+        alert = payload[0]
+        assert "Connection refused" in alert['annotations']['description']
+
     @patch('monitor.requests.post')
     def test_notification_with_ssl_error(self, mock_post, config_file):
         """Test notification with SSL error."""
@@ -476,10 +485,9 @@ class TestWebhookNotificationVariations:
         monitor.send_discord_notification("https://example.com", error_details)
         assert mock_post.called
         payload = mock_post.call_args[1]['json']
-        # Check that SSL error is in the fields
-        fields = payload['attachments'][0]['fields']
-        ssl_field = [f for f in fields if f['title'] == 'Error Details']
-        assert len(ssl_field) > 0
+        alert = payload[0]
+        assert alert['labels']['severity'] == 'critical'
+        assert "SSL" in alert['annotations']['description']
 
     @patch('monitor.requests.post')
     def test_notification_with_all_errors(self, mock_post, config_file):
@@ -497,6 +505,13 @@ class TestWebhookNotificationVariations:
 
         monitor.send_discord_notification("https://example.com", error_details)
         assert mock_post.called
+
+        payload = mock_post.call_args[1]['json']
+        alert = payload[0]
+        assert alert['labels']['severity'] == 'critical'
+        assert alert['labels']['status_code'] == '503'
+        assert "Service Unavailable" in alert['annotations']['description']
+        assert "SSL" in alert['annotations']['description']
 
     @patch('monitor.requests.post')
     def test_notification_webhook_failure(self, mock_post, config_file):
@@ -882,6 +897,32 @@ class TestNotificationEdgeCases:
 
         monitor.send_discord_notification("https://example.com", error_details)
         assert mock_post.called
+
+        payload = mock_post.call_args[1]['json']
+        alert = payload[0]
+        assert alert['annotations']['description'] == "URL is unreachable"
+
+    @patch('monitor.requests.post')
+    def test_notification_warning_severity(self, mock_post, config_file):
+        """Test notification with warning severity for 4xx errors."""
+        monitor = URLMonitor(config_file)
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_post.return_value = mock_response
+
+        error_details = {
+            "status_code": 404,
+            "error": "Not Found",
+            "ssl_error": None
+        }
+
+        monitor.send_discord_notification("https://example.com", error_details)
+        assert mock_post.called
+
+        payload = mock_post.call_args[1]['json']
+        alert = payload[0]
+        assert alert['labels']['severity'] == 'warning'
+        assert alert['labels']['status_code'] == '404'
 
 
 class TestStopDaemonForcedKill:
