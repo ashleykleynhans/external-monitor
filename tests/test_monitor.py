@@ -39,6 +39,19 @@ urls:
     os.unlink(config_path)
 
 
+@pytest.fixture
+def state_file():
+    """Create a temporary state file for testing."""
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+        state_path = f.name
+
+    yield state_path
+
+    # Cleanup
+    if os.path.exists(state_path):
+        os.unlink(state_path)
+
+
 class TestURLMonitor:
     """Test cases for URLMonitor class."""
 
@@ -583,9 +596,10 @@ class TestMonitorOnce:
 
     @patch('monitor.URLMonitor.check_url')
     @patch('monitor.URLMonitor.send_discord_notification')
-    def test_monitor_once_all_success(self, mock_notify, mock_check, config_file):
+    @patch('monitor.URLMonitor._save_state')
+    def test_monitor_once_all_success(self, mock_save, mock_notify, mock_check, config_file, state_file):
         """Test monitor_once with all URLs successful."""
-        monitor = URLMonitor(config_file)
+        monitor = URLMonitor(config_file, state_file)
         mock_check.return_value = {
             "success": True,
             "status_code": 200,
@@ -597,12 +611,14 @@ class TestMonitorOnce:
 
         assert mock_check.call_count == 2  # 2 URLs in config
         mock_notify.assert_not_called()
+        mock_save.assert_called_once()
 
     @patch('monitor.URLMonitor.check_url')
     @patch('monitor.URLMonitor.send_discord_notification')
-    def test_monitor_once_with_failure(self, mock_notify, mock_check, config_file):
-        """Test monitor_once with one URL failing."""
-        monitor = URLMonitor(config_file)
+    @patch('monitor.URLMonitor._save_state')
+    def test_monitor_once_with_failure(self, mock_save, mock_notify, mock_check, config_file, state_file):
+        """Test monitor_once with one URL failing (first time failure)."""
+        monitor = URLMonitor(config_file, state_file)
 
         def check_side_effect(url):
             if "example.com" in url:
@@ -949,3 +965,269 @@ class TestStopDaemonForcedKill:
         assert mock_kill.call_count >= 2
         assert result is True
         mock_remove.assert_called_once()
+
+
+class TestStateManagement:
+    """Test cases for alert state management."""
+
+    @patch('monitor.URLMonitor.check_url')
+    @patch('monitor.URLMonitor.send_discord_notification')
+    def test_first_failure_sends_firing_alert(self, mock_notify, mock_check, config_file, state_file):
+        """Test that first failure sends a firing alert."""
+        monitor = URLMonitor(config_file, state_file)
+
+        # Simulate a failure
+        mock_check.return_value = {
+            "success": False,
+            "status_code": 500,
+            "error": "Internal Server Error",
+            "ssl_error": None
+        }
+
+        monitor.monitor_once()
+
+        # Should have sent firing alert for both URLs (new failures)
+        assert mock_notify.call_count == 2
+        # Check that status="firing" was used
+        for call in mock_notify.call_args_list:
+            assert call[1]['status'] == 'firing'
+
+    @patch('monitor.URLMonitor.check_url')
+    @patch('monitor.URLMonitor.send_discord_notification')
+    def test_continued_failure_no_alert(self, mock_notify, mock_check, config_file, state_file):
+        """Test that continued failures don't send additional alerts."""
+        monitor = URLMonitor(config_file, state_file)
+
+        # First failure
+        mock_check.return_value = {
+            "success": False,
+            "status_code": 500,
+            "error": "Internal Server Error",
+            "ssl_error": None
+        }
+
+        monitor.monitor_once()
+        assert mock_notify.call_count == 2  # Both URLs fail, both send alerts
+
+        # Second failure (should not send alerts)
+        mock_notify.reset_mock()
+        monitor.monitor_once()
+        assert mock_notify.call_count == 0  # No alerts sent
+
+    @patch('monitor.URLMonitor.check_url')
+    @patch('monitor.URLMonitor.send_discord_notification')
+    def test_recovery_sends_resolved_alert(self, mock_notify, mock_check, config_file, state_file):
+        """Test that recovery from failure sends a resolved alert."""
+        monitor = URLMonitor(config_file, state_file)
+
+        # First failure
+        mock_check.return_value = {
+            "success": False,
+            "status_code": 500,
+            "error": "Internal Server Error",
+            "ssl_error": None
+        }
+
+        monitor.monitor_once()
+        assert mock_notify.call_count == 2  # Firing alerts
+
+        # Recovery
+        mock_notify.reset_mock()
+        mock_check.return_value = {
+            "success": True,
+            "status_code": 200,
+            "error": None,
+            "ssl_error": None
+        }
+
+        monitor.monitor_once()
+        assert mock_notify.call_count == 2  # Resolved alerts
+        # Check that status="resolved" was used
+        for call in mock_notify.call_args_list:
+            assert call[1]['status'] == 'resolved'
+
+    @patch('monitor.URLMonitor.check_url')
+    @patch('monitor.URLMonitor.send_discord_notification')
+    def test_state_persists_between_checks(self, mock_notify, mock_check, config_file, state_file):
+        """Test that state persists to file and can be reloaded."""
+        # First monitor instance - create failing state
+        monitor1 = URLMonitor(config_file, state_file)
+        mock_check.return_value = {
+            "success": False,
+            "status_code": 503,
+            "error": "Service Unavailable",
+            "ssl_error": None
+        }
+
+        monitor1.monitor_once()
+        assert mock_notify.call_count == 2  # Firing alerts
+
+        # Create new monitor instance - should load state
+        mock_notify.reset_mock()
+        monitor2 = URLMonitor(config_file, state_file)
+
+        # URL still failing - should not send alert
+        monitor2.monitor_once()
+        assert mock_notify.call_count == 0  # No new alerts
+
+    @patch('requests.post')
+    def test_resolved_alert_uses_previous_severity(self, mock_post, config_file, state_file):
+        """Test that resolved alerts use the severity from the original failure."""
+        monitor = URLMonitor(config_file, state_file)
+
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_post.return_value = mock_response
+
+        # Set up state with a critical failure
+        monitor.state["https://example.com"] = {
+            "failing": True,
+            "severity": "critical",
+            "first_failure": "2025-10-28T10:00:00"
+        }
+
+        # Send resolved alert
+        monitor.send_discord_notification("https://example.com", {}, status="resolved")
+
+        # Check that the resolved alert uses "critical" severity
+        payload = mock_post.call_args[1]['json']
+        alert = payload['alerts'][0]
+        assert alert['status'] == 'resolved'
+        assert alert['labels']['severity'] == 'critical'
+        assert 'now accessible' in alert['annotations']['summary']
+
+    @patch('requests.post')
+    def test_resolved_alert_format(self, mock_post, config_file, state_file):
+        """Test the format of resolved alerts."""
+        monitor = URLMonitor(config_file, state_file)
+
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_post.return_value = mock_response
+
+        # Set up state
+        monitor.state["https://example.com"] = {
+            "failing": True,
+            "severity": "warning",
+            "first_failure": "2025-10-28T10:00:00"
+        }
+
+        # Send resolved alert
+        monitor.send_discord_notification("https://example.com", {}, status="resolved")
+
+        # Verify resolved alert structure
+        payload = mock_post.call_args[1]['json']
+        alert = payload['alerts'][0]
+
+        assert alert['status'] == 'resolved'
+        assert 'endsAt' in alert
+        assert 'startsAt' not in alert
+        assert alert['labels']['url'] == 'https://example.com'
+        assert alert['labels']['environment'] == 'prod'
+        assert 'recovered' in alert['annotations']['description'].lower()
+
+    def test_state_file_load_with_invalid_json(self, config_file, state_file):
+        """Test that invalid state file is handled gracefully."""
+        # Write invalid JSON to state file
+        with open(state_file, 'w') as f:
+            f.write("{ invalid json }")
+
+        # Should not raise an exception, should start with empty state
+        monitor = URLMonitor(config_file, state_file)
+        assert monitor.state == {}
+
+    def test_state_file_load_missing_file(self, config_file, state_file):
+        """Test that missing state file is handled gracefully."""
+        # Delete state file
+        os.unlink(state_file)
+
+        # Should not raise an exception, should start with empty state
+        monitor = URLMonitor(config_file, state_file)
+        assert monitor.state == {}
+
+    @patch('json.load', side_effect=IOError("Disk read error"))
+    def test_state_file_load_generic_exception(self, mock_load, config_file, state_file):
+        """Test that generic exceptions during state load are handled gracefully."""
+        # Write something to state file so open() succeeds but json.load() fails
+        with open(state_file, 'w') as f:
+            f.write('{"test": "data"}')
+
+        # Should not raise an exception, should start with empty state
+        monitor = URLMonitor(config_file, state_file)
+        assert monitor.state == {}
+
+    @patch('json.dump', side_effect=IOError("Disk full"))
+    def test_state_file_save_exception(self, mock_dump, config_file, state_file):
+        """Test that exceptions during state save are handled gracefully."""
+        # Create monitor with state
+        monitor = URLMonitor(config_file, state_file)
+        monitor.state = {"https://example.com": {"failing": True}}
+
+        # Should not raise an exception
+        monitor._save_state()
+
+    @patch('monitor.URLMonitor.check_url')
+    @patch('monitor.URLMonitor.send_discord_notification')
+    def test_first_failure_with_ssl_error(self, mock_notify, mock_check, config_file, state_file):
+        """Test first failure with SSL error sets critical severity."""
+        monitor = URLMonitor(config_file, state_file)
+
+        # Simulate an SSL error
+        mock_check.return_value = {
+            "success": False,
+            "status_code": None,
+            "error": None,
+            "ssl_error": "SSL certificate expired"
+        }
+
+        monitor.monitor_once()
+
+        # Should have sent firing alert
+        assert mock_notify.call_count == 2
+        # Check that state has critical severity
+        for url in monitor.urls:
+            assert monitor.state[url]["severity"] == "critical"
+
+    @patch('monitor.URLMonitor.check_url')
+    @patch('monitor.URLMonitor.send_discord_notification')
+    def test_first_failure_with_4xx_error(self, mock_notify, mock_check, config_file, state_file):
+        """Test first failure with 4xx error sets warning severity."""
+        monitor = URLMonitor(config_file, state_file)
+
+        # Simulate a 404 error
+        mock_check.return_value = {
+            "success": False,
+            "status_code": 404,
+            "error": "Not Found",
+            "ssl_error": None
+        }
+
+        monitor.monitor_once()
+
+        # Should have sent firing alert
+        assert mock_notify.call_count == 2
+        # Check that state has warning severity
+        for url in monitor.urls:
+            assert monitor.state[url]["severity"] == "warning"
+
+    @patch('monitor.URLMonitor.check_url')
+    @patch('monitor.URLMonitor.send_discord_notification')
+    def test_first_failure_with_3xx_error(self, mock_notify, mock_check, config_file, state_file):
+        """Test first failure with 3xx error stays as critical severity (default)."""
+        monitor = URLMonitor(config_file, state_file)
+
+        # Simulate a 301 redirect error
+        mock_check.return_value = {
+            "success": False,
+            "status_code": 301,
+            "error": "Moved Permanently",
+            "ssl_error": None
+        }
+
+        monitor.monitor_once()
+
+        # Should have sent firing alert
+        assert mock_notify.call_count == 2
+        # Check that state has critical severity (default when not 4xx or 5xx)
+        for url in monitor.urls:
+            assert monitor.state[url]["severity"] == "critical"

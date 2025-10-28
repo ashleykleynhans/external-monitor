@@ -29,6 +29,7 @@ import os
 import signal
 import argparse
 import atexit
+import json
 from datetime import datetime
 from typing import List, Dict, Optional
 from urllib.parse import urlparse
@@ -47,6 +48,7 @@ CHECK_INTERVAL = 120
 # Daemon configuration
 PID_FILE = "/tmp/url_monitor.pid"
 LOG_FILE = "/tmp/url_monitor.log"
+STATE_FILE = "/tmp/url_monitor_state.json"
 
 # Global flag for graceful shutdown
 shutdown_requested = False
@@ -170,12 +172,14 @@ def daemonize(pid_file: str, log_file: str):  # pragma: no cover
 class URLMonitor:
     """Monitor URLs for availability and SSL certificate validity."""
 
-    def __init__(self, config_path: str = "config.yml"):
+    def __init__(self, config_path: str = "config.yml", state_file: str = STATE_FILE):
         """Initialize the monitor with configuration."""
         self.config = self._load_config(config_path)
         self.webhook_url = self.config.get("webhook_url")
         self.urls = self.config.get("urls", [])
         self.hostname = socket.gethostname()
+        self.state_file = state_file
+        self.state = self._load_state()
 
         if not self.webhook_url:
             raise ValueError("webhook_url is required in config.yml")
@@ -196,6 +200,29 @@ class URLMonitor:
         except yaml.YAMLError as e:
             logger.error(f"Error parsing config file: {e}")
             raise
+
+    def _load_state(self) -> Dict:
+        """Load state from JSON file."""
+        try:
+            with open(self.state_file, 'r') as f:
+                return json.load(f)
+        except FileNotFoundError:
+            logger.info("No existing state file found, starting fresh")
+            return {}
+        except json.JSONDecodeError as e:
+            logger.warning(f"Invalid state file, starting fresh: {e}")
+            return {}
+        except Exception as e:
+            logger.warning(f"Error loading state file, starting fresh: {e}")
+            return {}
+
+    def _save_state(self):
+        """Save state to JSON file."""
+        try:
+            with open(self.state_file, 'w') as f:
+                json.dump(self.state, f, indent=2)
+        except Exception as e:
+            logger.error(f"Failed to save state: {e}")
 
     def check_ssl_certificate(self, hostname: str, port: int = 443) -> Optional[str]:
         """
@@ -262,50 +289,71 @@ class URLMonitor:
 
         return result
 
-    def send_discord_notification(self, url: str, error_details: Dict):
+    def send_discord_notification(self, url: str, error_details: Dict, status: str = "firing"):
         """Send notification to Alertmanager via webhook."""
         from datetime import datetime, timezone
 
-        # Build alert description
-        description_parts = []
-        if error_details.get("error"):
-            description_parts.append(error_details['error'])
-        if error_details.get("ssl_error"):
-            description_parts.append(f"SSL: {error_details['ssl_error']}")
+        if status == "resolved":
+            # For resolved alerts, send simpler payload
+            severity = self.state.get(url, {}).get("severity", "critical")
+            alert = {
+                "status": "resolved",
+                "labels": {
+                    "alertname": "URLMonitorAlert",
+                    "severity": severity,
+                    "url": url,
+                    "instance": self.hostname,
+                    "service": "external-monitor",
+                    "environment": "prod"
+                },
+                "annotations": {
+                    "summary": f"URL Monitor Alert: {url} is now accessible",
+                    "description": "URL has recovered and is now responding normally"
+                },
+                "endsAt": datetime.now(timezone.utc).isoformat(),
+                "generatorURL": f"http://{self.hostname}/external-monitor"
+            }
+        else:
+            # Build alert description for firing alerts
+            description_parts = []
+            if error_details.get("error"):
+                description_parts.append(error_details['error'])
+            if error_details.get("ssl_error"):
+                description_parts.append(f"SSL: {error_details['ssl_error']}")
 
-        description = " | ".join(description_parts) if description_parts else "URL is unreachable"
+            description = " | ".join(description_parts) if description_parts else "URL is unreachable"
 
-        # Determine severity based on error type
-        severity = "critical"
-        if error_details.get("ssl_error"):
+            # Determine severity based on error type
             severity = "critical"
-        elif error_details.get("status_code") and error_details["status_code"] >= 500:
-            severity = "critical"
-        elif error_details.get("status_code") and error_details["status_code"] >= 400:
-            severity = "warning"
+            if error_details.get("ssl_error"):
+                severity = "critical"
+            elif error_details.get("status_code") and error_details["status_code"] >= 500:
+                severity = "critical"
+            elif error_details.get("status_code") and error_details["status_code"] >= 400:
+                severity = "warning"
 
-        # Build Alertmanager-compatible payload
-        alert = {
-            "status": "firing",
-            "labels": {
-                "alertname": "URLMonitorAlert",
-                "severity": severity,
-                "url": url,
-                "instance": self.hostname,
-                "service": "external-monitor",
-                "environment": "prod"
-            },
-            "annotations": {
-                "summary": f"URL Monitor Alert: {url} is down or unreachable",
-                "description": description
-            },
-            "startsAt": datetime.now(timezone.utc).isoformat(),
-            "generatorURL": f"http://{self.hostname}/external-monitor"
-        }
+            # Build Alertmanager-compatible payload
+            alert = {
+                "status": "firing",
+                "labels": {
+                    "alertname": "URLMonitorAlert",
+                    "severity": severity,
+                    "url": url,
+                    "instance": self.hostname,
+                    "service": "external-monitor",
+                    "environment": "prod"
+                },
+                "annotations": {
+                    "summary": f"URL Monitor Alert: {url} is down or unreachable",
+                    "description": description
+                },
+                "startsAt": datetime.now(timezone.utc).isoformat(),
+                "generatorURL": f"http://{self.hostname}/external-monitor"
+            }
 
-        # Add status code to labels if available
-        if error_details.get("status_code"):
-            alert["labels"]["status_code"] = str(error_details["status_code"])
+            # Add status code to labels if available
+            if error_details.get("status_code"):
+                alert["labels"]["status_code"] = str(error_details["status_code"])
 
         # Wrap alerts in payload object (Alertmanager webhook format)
         payload = {
@@ -338,12 +386,45 @@ class URLMonitor:
 
         for url in self.urls:
             result = self.check_url(url)
+            previous_state = self.state.get(url, {})
+            was_failing = previous_state.get("failing", False)
 
             if result["success"]:
                 logger.info(f"OK: {url} (HTTP {result['status_code']})")
+
+                # If it was failing before, send a resolved alert
+                if was_failing:
+                    logger.info(f"URL recovered: {url}")
+                    self.send_discord_notification(url, {}, status="resolved")
+                    # Remove from state or mark as not failing
+                    self.state[url] = {"failing": False}
             else:
                 logger.warning(f"FAIL: {url}")
-                self.send_discord_notification(url, result)
+
+                # Only send alert if this is a new failure (state change)
+                if not was_failing:
+                    logger.info(f"New failure detected: {url}")
+
+                    # Determine severity for state tracking
+                    severity = "critical"
+                    if result.get("ssl_error"):
+                        severity = "critical"
+                    elif result.get("status_code") and result["status_code"] >= 500:
+                        severity = "critical"
+                    elif result.get("status_code") and result["status_code"] >= 400:
+                        severity = "warning"
+
+                    self.send_discord_notification(url, result, status="firing")
+                    self.state[url] = {
+                        "failing": True,
+                        "severity": severity,
+                        "first_failure": datetime.now().isoformat()
+                    }
+                else:
+                    logger.debug(f"URL still failing (no alert sent): {url}")
+
+        # Save state after processing all URLs
+        self._save_state()
 
     def run(self):
         """Run the monitoring loop continuously."""
