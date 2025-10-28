@@ -305,8 +305,10 @@ class URLMonitor:
         if error_details.get("status_code"):
             alert["labels"]["status_code"] = str(error_details["status_code"])
 
-        # Alertmanager expects an array of alerts
-        payload = [alert]
+        # Wrap alerts in payload object (Alertmanager webhook format)
+        payload = {
+            "alerts": [alert]
+        }
 
         # Append severity to webhook URL (e.g., /alert/critical or /alert/warning)
         webhook_url = f"{self.webhook_url.rstrip('/')}/{severity}"

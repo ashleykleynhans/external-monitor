@@ -152,10 +152,11 @@ urls: []
 
         # Verify payload structure (Alertmanager format)
         payload = call_args[1]['json']
-        assert isinstance(payload, list)
-        assert len(payload) == 1
+        assert 'alerts' in payload
+        assert isinstance(payload['alerts'], list)
+        assert len(payload['alerts']) == 1
 
-        alert = payload[0]
+        alert = payload['alerts'][0]
         assert 'labels' in alert
         assert 'annotations' in alert
         assert 'startsAt' in alert
@@ -465,8 +466,8 @@ class TestWebhookNotificationVariations:
         assert mock_post.called
 
         payload = mock_post.call_args[1]['json']
-        assert isinstance(payload, list)
-        alert = payload[0]
+        assert 'alerts' in payload
+        alert = payload['alerts'][0]
         assert "Connection refused" in alert['annotations']['description']
 
     @patch('monitor.requests.post')
@@ -486,7 +487,7 @@ class TestWebhookNotificationVariations:
         monitor.send_discord_notification("https://example.com", error_details)
         assert mock_post.called
         payload = mock_post.call_args[1]['json']
-        alert = payload[0]
+        alert = payload['alerts'][0]
         assert alert['labels']['severity'] == 'critical'
         assert "SSL" in alert['annotations']['description']
 
@@ -508,7 +509,7 @@ class TestWebhookNotificationVariations:
         assert mock_post.called
 
         payload = mock_post.call_args[1]['json']
-        alert = payload[0]
+        alert = payload['alerts'][0]
         assert alert['labels']['severity'] == 'critical'
         assert alert['labels']['status_code'] == '503'
         assert "Service Unavailable" in alert['annotations']['description']
@@ -900,7 +901,7 @@ class TestNotificationEdgeCases:
         assert mock_post.called
 
         payload = mock_post.call_args[1]['json']
-        alert = payload[0]
+        alert = payload['alerts'][0]
         assert alert['annotations']['description'] == "URL is unreachable"
 
     @patch('monitor.requests.post')
@@ -921,7 +922,7 @@ class TestNotificationEdgeCases:
         assert mock_post.called
 
         payload = mock_post.call_args[1]['json']
-        alert = payload[0]
+        alert = payload['alerts'][0]
         assert alert['labels']['severity'] == 'warning'
         assert alert['labels']['status_code'] == '404'
 
