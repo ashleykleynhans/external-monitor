@@ -7,6 +7,7 @@ import tempfile
 import os
 import signal
 import time
+import requests
 from unittest.mock import Mock, patch, MagicMock, mock_open
 from monitor import (
     URLMonitor,
@@ -198,13 +199,9 @@ urls: []
         assert monitor.hostname == "test-server-123"
 
     @patch('monitor.requests.get')
-    @patch('monitor.URLMonitor.check_ssl_certificate')
-    def test_check_url_https_ssl_check(self, mock_ssl_check, mock_get, config_file):
-        """Test that SSL check is performed for HTTPS URLs."""
+    def test_check_url_https_ssl_check(self, mock_get, config_file):
+        """Test that HTTPS URLs with valid SSL work correctly."""
         monitor = URLMonitor(config_file)
-
-        # Mock SSL check returns no error
-        mock_ssl_check.return_value = None
 
         # Mock successful response
         mock_response = Mock()
@@ -213,28 +210,26 @@ urls: []
 
         result = monitor.check_url("https://example.com")
 
-        # Verify SSL check was called
-        assert mock_ssl_check.called
+        # Verify request was made with verify=True (SSL validation enabled)
+        mock_get.assert_called_once()
+        call_kwargs = mock_get.call_args[1]
+        assert call_kwargs['verify'] is True
         assert result["success"] is True
 
     @patch('monitor.requests.get')
-    @patch('monitor.URLMonitor.check_ssl_certificate')
-    def test_check_url_https_ssl_error(self, mock_ssl_check, mock_get, config_file):
-        """Test SSL error detection."""
+    def test_check_url_https_ssl_error(self, mock_get, config_file):
+        """Test SSL error detection from requests library."""
         monitor = URLMonitor(config_file)
 
-        # Mock SSL check returns error
-        mock_ssl_check.return_value = "SSL certificate expired"
-
-        # Mock successful HTTP response (but SSL failed)
-        mock_response = Mock()
-        mock_response.status_code = 200
-        mock_get.return_value = mock_response
+        # Mock SSL error from requests library
+        mock_get.side_effect = requests.exceptions.SSLError("Certificate verify failed")
 
         result = monitor.check_url("https://example.com")
 
         assert result["success"] is False
-        assert result["ssl_error"] == "SSL certificate expired"
+        assert result["ssl_error"] is not None
+        assert "SSL Error" in result["ssl_error"]
+        assert "SSL connection error" in result["error"]
 
 
 class TestDaemonFunctions:

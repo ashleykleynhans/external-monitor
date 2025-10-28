@@ -247,6 +247,7 @@ class URLMonitor:
         """
         Check a URL for availability and SSL validity.
         Follows redirects automatically and reports the final status code.
+        SSL validation is performed by requests library for all URLs in redirect chain.
         Returns a dict with status and error information.
         """
         result = {
@@ -257,18 +258,12 @@ class URLMonitor:
             "ssl_error": None
         }
 
-        parsed_url = urlparse(url)
-
-        # Check SSL certificate if HTTPS
-        if parsed_url.scheme == "https":
-            ssl_error = self.check_ssl_certificate(parsed_url.hostname)
-            if ssl_error:
-                result["success"] = False
-                result["ssl_error"] = ssl_error
-
-        # Check HTTP response
+        # Check HTTP response (SSL validation handled by requests library)
         try:
-            response = requests.get(url, timeout=10, verify=True, allow_redirects=True)
+            headers = {
+                'User-Agent': 'External Monitor v0.0.1'
+            }
+            response = requests.get(url, timeout=10, verify=True, allow_redirects=True, headers=headers)
             result["status_code"] = response.status_code
 
             if response.status_code != 200:
@@ -277,6 +272,7 @@ class URLMonitor:
 
         except requests.exceptions.SSLError as e:
             result["success"] = False
+            result["ssl_error"] = f"SSL Error: {str(e)}"
             result["error"] = f"SSL connection error: {str(e)}"
         except requests.exceptions.ConnectionError as e:
             result["success"] = False
@@ -427,13 +423,15 @@ class URLMonitor:
         # Save state after processing all URLs
         self._save_state()
 
-    def run(self):
+    def run(self, daemon_mode: bool = True):
         """Run the monitoring loop continuously."""
         global shutdown_requested
 
         # Set up signal handlers
         signal.signal(signal.SIGTERM, signal_handler)
-        signal.signal(signal.SIGINT, signal_handler)
+        # Only override SIGINT in daemon mode; let KeyboardInterrupt work in foreground
+        if daemon_mode:
+            signal.signal(signal.SIGINT, signal_handler)
 
         logger.info(f"Starting monitoring loop (check every {CHECK_INTERVAL}s)...")
 
@@ -569,7 +567,7 @@ def main():
         print("Running in foreground mode (Ctrl+C to stop)...")
         try:
             monitor = URLMonitor(args.config)
-            monitor.run()
+            monitor.run(daemon_mode=False)
         except KeyboardInterrupt:
             logger.info("Monitoring stopped by user")
         except Exception as e:
