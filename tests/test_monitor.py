@@ -168,6 +168,7 @@ urls: []
         assert alert['labels']['url'] == 'https://example.com'
         assert alert['labels']['instance'] == monitor.hostname
         assert alert['labels']['service'] == 'external-monitor'
+        assert alert['labels']['environment'] == 'prod'
         assert alert['labels']['status_code'] == '500'
 
         # Verify annotations

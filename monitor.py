@@ -286,12 +286,14 @@ class URLMonitor:
 
         # Build Alertmanager-compatible payload
         alert = {
+            "status": "firing",
             "labels": {
                 "alertname": "URLMonitorAlert",
                 "severity": severity,
                 "url": url,
                 "instance": self.hostname,
-                "service": "external-monitor"
+                "service": "external-monitor",
+                "environment": "prod"
             },
             "annotations": {
                 "summary": f"URL Monitor Alert: {url} is down or unreachable",
