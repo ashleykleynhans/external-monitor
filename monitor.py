@@ -101,7 +101,7 @@ def is_process_running(pid: int) -> bool:
         return False
 
 
-def daemonize(pid_file: str, log_file: str):
+def daemonize(pid_file: str, log_file: str):  # pragma: no cover
     """
     Daemonize the current process using double-fork method.
     """
@@ -264,56 +264,82 @@ class URLMonitor:
 
     def send_discord_notification(self, url: str, error_details: Dict):
         """Send notification to Discord via webhook."""
-        timestamp = datetime.utcnow().isoformat()
+        import time
+        timestamp = int(time.time())
 
-        # Build error message
-        error_parts = []
-        if error_details.get("status_code"):
-            error_parts.append(f"Status Code: {error_details['status_code']}")
+        # Build error summary for fallback
+        error_summary = f"**URL Monitor Alert:** {url}\n\n"
+        error_summary += f"**Details:** "
+
         if error_details.get("error"):
-            error_parts.append(f"Error: {error_details['error']}")
+            error_summary += f"{error_details['error']}"
+
+        # Build title with emoji
+        title = ":rotating_light: URL Monitor Alert"
+
+        # Build main text
+        text_parts = [f"*{url}* is down or unreachable"]
+
+        # Build fields for Slack attachment
+        fields = []
+
+        if error_details.get("status_code"):
+            fields.append({
+                "title": "HTTP Status",
+                "value": f"`{error_details['status_code']}`",
+                "short": True
+            })
+
+        fields.append({
+            "title": "Monitored From",
+            "value": f"`{self.hostname}`",
+            "short": True
+        })
+
+        # Add error details as a single formatted field
+        error_messages = []
+        if error_details.get("error"):
+            error_messages.append(f"• {error_details['error']}")
         if error_details.get("ssl_error"):
-            error_parts.append(f"SSL Error: {error_details['ssl_error']}")
+            error_messages.append(f"• SSL: {error_details['ssl_error']}")
 
-        error_message = "\n".join(error_parts)
+        if error_messages:
+            fields.append({
+                "title": "Error Details",
+                "value": "\n".join(error_messages),
+                "short": False
+            })
 
-        # Discord webhook payload (Slack-compatible format)
+        # Slack-compatible webhook payload
         payload = {
-            "embeds": [{
-                "title": "URL Monitor Alert",
-                "color": 15158332,  # Red color
-                "fields": [
-                    {
-                        "name": "URL",
-                        "value": url,
-                        "inline": False
-                    },
-                    {
-                        "name": "Monitoring Host",
-                        "value": self.hostname,
-                        "inline": True
-                    },
-                    {
-                        "name": "Details",
-                        "value": error_message,
-                        "inline": False
-                    }
-                ],
-                "timestamp": timestamp
+            "channel": "#alerts-critical-prod",
+            "username": "URL Monitor",
+            "icon_emoji": ":python:",
+            "attachments": [{
+                "fallback": error_summary,
+                "color": "#ff0000",  # Bright red
+                "title": title,
+                "text": "\n".join(text_parts),
+                "fields": fields,
+                "footer": "External Monitor",
+                "footer_icon": "https://platform.slack-edge.com/img/default_application_icon.png",
+                "ts": timestamp
             }]
         }
 
         try:
+            logger.debug(f"Sending webhook payload: {payload}")
             response = requests.post(
                 self.webhook_url,
                 json=payload,
                 timeout=10
             )
-            if response.status_code == 204:
+            logger.debug(f"Webhook response status: {response.status_code}")
+            if response.status_code in (200, 204):
                 logger.info(f"Notification sent for {url}")
             else:
                 logger.error(
-                    f"Failed to send notification: {response.status_code}"
+                    f"Failed to send notification: {response.status_code} - {response.text}"
                 )
         except Exception as e:
             logger.error(f"Error sending notification: {e}")

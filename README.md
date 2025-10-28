@@ -216,22 +216,29 @@ Each notification includes:
 
 ## Testing
 
-Run the test suite:
+Run the test suite (coverage reports are automatically generated):
 
 ```bash
-python3 -m pytest tests/
+python3 -m pytest
 ```
 
-Run tests with verbose output:
+The test configuration (`pytest.ini`) automatically includes:
+- Verbose output
+- Coverage measurement for `monitor.py`
+- Terminal coverage report with missing lines
+- HTML coverage report (opens `htmlcov/index.html` to view)
+- Branch coverage analysis
 
+View the HTML coverage report:
 ```bash
-python3 -m pytest tests/ -v
+open htmlcov/index.html  # macOS
+xdg-open htmlcov/index.html  # Linux
 ```
 
-Run tests with coverage report:
+Run tests without coverage (faster):
 
 ```bash
-python3 -m pytest tests/ --cov=monitor --cov-report=term-missing
+python3 -m pytest --no-cov
 ```
 
 ## Troubleshooting

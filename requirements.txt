@@ -1,3 +1,4 @@
 requests
 PyYAML
 pytest
+pytest-cov

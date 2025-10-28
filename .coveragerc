@@ -1,0 +1,23 @@
+[run]
+source = .
+omit = 
+    venv/*
+    tests/*
+    test.py
+    utils.py
+    .pytest_cache/*
+    htmlcov/*
+    */__pycache__/*
+    .git/*
+    .idea/*
+    *_example.py
+    examples/*
+
+[report]
+exclude_lines =
+    pragma: no cover
+    def __repr__
+    raise NotImplementedError
+    if __name__ == .__main__.:
+    pass
+    raise ImportError
