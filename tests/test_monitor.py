@@ -344,6 +344,25 @@ class TestDaemonFunctions:
         # Should have called monitor_once at least once
         assert mock_monitor_once.called
 
+    @patch('monitor.URLMonitor.monitor_once')
+    @patch('monitor.time.sleep')
+    def test_run_foreground_mode(self, mock_sleep, mock_monitor_once, config_file):
+        """Test that run method works in foreground mode (daemon_mode=False)."""
+        import monitor
+        monitor.shutdown_requested = False
+
+        # Create a side effect that sets shutdown after first call
+        def set_shutdown(*args):
+            monitor.shutdown_requested = True
+
+        mock_monitor_once.side_effect = set_shutdown
+
+        url_monitor = URLMonitor(config_file)
+        url_monitor.run(daemon_mode=False)
+
+        # Should have called monitor_once at least once
+        assert mock_monitor_once.called
+
     @patch('monitor.read_pid_file')
     @patch('monitor.is_process_running')
     def test_stop_daemon_not_running(self, mock_is_running, mock_read_pid):
