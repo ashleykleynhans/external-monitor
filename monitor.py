@@ -30,6 +30,7 @@ import signal
 import argparse
 import atexit
 import json
+import shutil
 from datetime import datetime
 from typing import List, Dict, Optional
 from urllib.parse import urlparse
@@ -320,9 +321,9 @@ class URLMonitor:
                     # Write consecutive failures metric
                     f.write(f'url_monitor_consecutive_failures{{url="{url_label}",instance="{self.hostname}"}} {consecutive_failures}\n')
 
-            # Atomically move the temp file to the final location
+            # Move the temp file to the final location (handles cross-filesystem moves)
             try:
-                os.replace(temp_file_path, textfile_path)
+                shutil.move(temp_file_path, textfile_path)
                 logger.debug(f"Wrote Prometheus metrics to {textfile_path}")
             except Exception as e:
                 # Clean up temp file if move failed
