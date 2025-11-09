@@ -19,7 +19,7 @@ StandardError=journal
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/tmp
+ReadWritePaths=/tmp /opt/prometheus/etc/node_exporter_textfiles
 
 # Environment
 Environment="PYTHONUNBUFFERED=1"
