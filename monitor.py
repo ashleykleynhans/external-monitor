@@ -56,6 +56,38 @@ DEFAULT_STATE_FILE = "/tmp/url_monitor_state.json"
 shutdown_requested = False
 
 
+def setup_logging(log_file: str = None, foreground: bool = False):
+    """
+    Configure logging to write to both console and file.
+
+    Args:
+        log_file: Path to log file. If None, only console logging is used.
+        foreground: If True, logs to both console and file. If False, only to file.
+    """
+    # Remove existing handlers
+    for handler in logger.handlers[:]:
+        logger.removeHandler(handler)
+
+    # Set formatter
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+
+    if foreground:
+        # Add console handler
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setFormatter(formatter)
+        console_handler.setLevel(logging.INFO)
+        logger.addHandler(console_handler)
+
+    if log_file:
+        # Add file handler
+        file_handler = logging.FileHandler(log_file)
+        file_handler.setFormatter(formatter)
+        file_handler.setLevel(logging.INFO)
+        logger.addHandler(file_handler)
+
+    logger.setLevel(logging.INFO)
+
+
 def signal_handler(signum, frame):
     """Handle shutdown signals gracefully."""
     global shutdown_requested
@@ -709,6 +741,8 @@ def main():
 
     elif args.command == 'foreground':
         print("Running in foreground mode (Ctrl+C to stop)...")
+        # Setup logging to write to both console and file
+        setup_logging(log_file=log_file, foreground=True)
         try:
             monitor = URLMonitor(args.config)
             monitor.run(daemon_mode=False)

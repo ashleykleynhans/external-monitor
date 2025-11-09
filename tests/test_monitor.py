@@ -18,7 +18,8 @@ from monitor import (
     read_pid_file,
     is_process_running,
     stop_daemon,
-    status_daemon
+    status_daemon,
+    setup_logging
 )
 
 
@@ -959,6 +960,75 @@ class TestMainFunction:
                 with pytest.raises(SystemExit) as exc_info:
                     main()
                 assert exc_info.value.code == 1
+
+
+class TestLoggingSetup:
+    """Test logging setup functionality."""
+
+    def test_setup_logging_foreground_with_file(self):
+        """Test setup_logging in foreground mode with log file."""
+        import logging
+        from monitor import logger
+
+        with tempfile.NamedTemporaryFile(mode='w', delete=False) as f:
+            log_file = f.name
+
+        try:
+            setup_logging(log_file=log_file, foreground=True)
+
+            # Check that logger has both console and file handlers
+            assert len(logger.handlers) == 2
+            handler_types = [type(h).__name__ for h in logger.handlers]
+            assert 'StreamHandler' in handler_types
+            assert 'FileHandler' in handler_types
+
+            # Test that logging works
+            logger.info("Test message")
+
+            # Verify log file was created and contains the message
+            with open(log_file, 'r') as f:
+                content = f.read()
+                assert "Test message" in content
+        finally:
+            if os.path.exists(log_file):
+                os.unlink(log_file)
+
+    def test_setup_logging_foreground_without_file(self):
+        """Test setup_logging in foreground mode without log file."""
+        import logging
+        from monitor import logger
+
+        setup_logging(log_file=None, foreground=True)
+
+        # Check that logger has only console handler
+        assert len(logger.handlers) == 1
+        assert type(logger.handlers[0]).__name__ == 'StreamHandler'
+
+    def test_setup_logging_daemon_mode(self):
+        """Test setup_logging in daemon mode (only file logging)."""
+        import logging
+        from monitor import logger
+
+        with tempfile.NamedTemporaryFile(mode='w', delete=False) as f:
+            log_file = f.name
+
+        try:
+            setup_logging(log_file=log_file, foreground=False)
+
+            # Check that logger has only file handler
+            assert len(logger.handlers) == 1
+            assert type(logger.handlers[0]).__name__ == 'FileHandler'
+
+            # Test that logging works
+            logger.info("Daemon test message")
+
+            # Verify log file was created and contains the message
+            with open(log_file, 'r') as f:
+                content = f.read()
+                assert "Daemon test message" in content
+        finally:
+            if os.path.exists(log_file):
+                os.unlink(log_file)
 
 
 class TestNotificationEdgeCases:
