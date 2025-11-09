@@ -22,3 +22,6 @@ urls:
 # pid_file: "/tmp/url_monitor.pid"
 # log_file: "/tmp/url_monitor.log"
 # state_file: "/tmp/url_monitor_state.json"
+
+# Prometheus textfile exporter configuration (optional)
+# prometheus_textfile_dir: "/etc/prometheus/node_exporter_textfiles"  # Directory for Prometheus textfile collector

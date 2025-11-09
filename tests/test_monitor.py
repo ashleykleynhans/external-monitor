@@ -1703,3 +1703,171 @@ class TestPagerDutyIntegration:
         assert result is True
         payload = mock_post.call_args[1]['json']
         assert payload['payload']['custom_details']['ssl_error'] == "Certificate has expired"
+
+
+class TestPrometheusMetrics:
+    """Test Prometheus textfile exporter functionality."""
+
+    def test_prometheus_metrics_written_successfully(self, config_file):
+        """Test that Prometheus metrics are written successfully."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Update config with prometheus directory
+            with open(config_file, 'r') as f:
+                config = yaml.safe_load(f)
+            config['prometheus_textfile_dir'] = tmpdir
+            with open(config_file, 'w') as f:
+                yaml.dump(config, f)
+
+            monitor = URLMonitor(config_file)
+
+            # Set some state
+            monitor.state = {
+                "https://example.com": {
+                    "alerted": False,
+                    "consecutive_failures": 0,
+                    "consecutive_successes": 5
+                },
+                "https://test.com": {
+                    "alerted": True,
+                    "consecutive_failures": 3,
+                    "consecutive_successes": 0
+                }
+            }
+
+            # Write metrics
+            monitor._write_prometheus_metrics()
+
+            # Verify file was created
+            metrics_file = os.path.join(tmpdir, "url_monitor.prom")
+            assert os.path.exists(metrics_file)
+
+            # Read and verify content
+            with open(metrics_file, 'r') as f:
+                content = f.read()
+
+            # Check for metric headers
+            assert "# HELP url_monitor_up" in content
+            assert "# TYPE url_monitor_up gauge" in content
+            assert "# HELP url_monitor_consecutive_failures" in content
+            assert "# TYPE url_monitor_consecutive_failures gauge" in content
+
+            # Check for metrics
+            assert 'url_monitor_up{url="https://example.com"' in content
+            assert 'url_monitor_up{url="https://test.com"' in content
+
+            # Check values - example.com is up (not alerted)
+            assert f'url_monitor_up{{url="https://example.com",instance="{monitor.hostname}"}} 1' in content
+            # test.com is down (alerted)
+            assert f'url_monitor_up{{url="https://test.com",instance="{monitor.hostname}"}} 0' in content
+
+            # Check consecutive failures
+            assert f'url_monitor_consecutive_failures{{url="https://example.com",instance="{monitor.hostname}"}} 0' in content
+            assert f'url_monitor_consecutive_failures{{url="https://test.com",instance="{monitor.hostname}"}} 3' in content
+
+    def test_prometheus_metrics_not_configured(self, config_file):
+        """Test that metrics are not written when prometheus_textfile_dir is not configured."""
+        monitor = URLMonitor(config_file)
+
+        # Should not raise an error, just return early
+        monitor._write_prometheus_metrics()
+
+        # No metrics file should be created (can't test directly, but shouldn't crash)
+        assert monitor.prometheus_textfile_dir is None
+
+    def test_prometheus_metrics_directory_created(self, config_file):
+        """Test that Prometheus metrics directory is created if it doesn't exist."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Use a subdirectory that doesn't exist yet
+            metrics_dir = os.path.join(tmpdir, "prometheus", "textfiles")
+
+            # Update config
+            with open(config_file, 'r') as f:
+                config = yaml.safe_load(f)
+            config['prometheus_textfile_dir'] = metrics_dir
+            with open(config_file, 'w') as f:
+                yaml.dump(config, f)
+
+            monitor = URLMonitor(config_file)
+            monitor.state = {}
+
+            # Write metrics
+            monitor._write_prometheus_metrics()
+
+            # Directory should be created
+            assert os.path.exists(metrics_dir)
+            assert os.path.isdir(metrics_dir)
+
+            # Metrics file should exist
+            metrics_file = os.path.join(metrics_dir, "url_monitor.prom")
+            assert os.path.exists(metrics_file)
+
+    def test_prometheus_metrics_write_error_handling(self, config_file):
+        """Test error handling when writing Prometheus metrics fails."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Update config
+            with open(config_file, 'r') as f:
+                config = yaml.safe_load(f)
+            config['prometheus_textfile_dir'] = tmpdir
+            with open(config_file, 'w') as f:
+                yaml.dump(config, f)
+
+            monitor = URLMonitor(config_file)
+            monitor.state = {}
+
+            # Make the directory read-only to cause write failure
+            os.chmod(tmpdir, 0o444)
+
+            try:
+                # Should not raise exception, just log error
+                monitor._write_prometheus_metrics()
+            finally:
+                # Restore permissions for cleanup
+                os.chmod(tmpdir, 0o755)
+
+    def test_prometheus_metrics_url_label_escaping(self, config_file):
+        """Test that URL labels with quotes are properly escaped."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Update config with URL containing quotes (edge case)
+            with open(config_file, 'r') as f:
+                config = yaml.safe_load(f)
+            config['prometheus_textfile_dir'] = tmpdir
+            # Not a realistic URL, but tests the escaping logic
+            config['urls'] = ['https://example.com/path?param="value"']
+            with open(config_file, 'w') as f:
+                yaml.dump(config, f)
+
+            monitor = URLMonitor(config_file)
+            monitor.state = {
+                'https://example.com/path?param="value"': {
+                    "alerted": False,
+                    "consecutive_failures": 0
+                }
+            }
+
+            # Write metrics
+            monitor._write_prometheus_metrics()
+
+            # Read and verify content
+            metrics_file = os.path.join(tmpdir, "url_monitor.prom")
+            with open(metrics_file, 'r') as f:
+                content = f.read()
+
+            # Quote should be escaped
+            assert 'url="https://example.com/path?param=\\"value\\""' in content
+
+    def test_prometheus_metrics_logged_on_init(self, config_file, caplog):
+        """Test that Prometheus configuration is logged on initialization."""
+        import logging
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Update config
+            with open(config_file, 'r') as f:
+                config = yaml.safe_load(f)
+            config['prometheus_textfile_dir'] = tmpdir
+            with open(config_file, 'w') as f:
+                yaml.dump(config, f)
+
+            with caplog.at_level(logging.INFO):
+                monitor = URLMonitor(config_file)
+
+            # Check that prometheus is mentioned in logs
+            assert any("Prometheus textfile exporter enabled" in record.message for record in caplog.records)

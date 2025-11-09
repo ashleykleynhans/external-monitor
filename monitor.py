@@ -225,6 +225,9 @@ class URLMonitor:
         self.state_file = state_file if state_file is not None else self.config.get("state_file", DEFAULT_STATE_FILE)
         self.state = self._load_state()
 
+        # Prometheus textfile configuration
+        self.prometheus_textfile_dir = self.config.get("prometheus_textfile_dir")
+
         if not self.webhook_url:
             raise ValueError("webhook_url is required in config.yml")
         if not self.urls:
@@ -236,6 +239,8 @@ class URLMonitor:
         logger.info(f"Thresholds - Failure: {self.failure_threshold}, Recovery: {self.recovery_threshold}")
         if self.pagerduty_key:
             logger.info("PagerDuty backup notifications enabled")
+        if self.prometheus_textfile_dir:
+            logger.info(f"Prometheus textfile exporter enabled: {self.prometheus_textfile_dir}")
 
     def _load_config(self, config_path: str) -> Dict:
         """Load configuration from YAML file."""
@@ -271,6 +276,56 @@ class URLMonitor:
                 json.dump(self.state, f, indent=2)
         except Exception as e:
             logger.error(f"Failed to save state: {e}")
+
+    def _write_prometheus_metrics(self):
+        """Write metrics to Prometheus textfile format."""
+        if not self.prometheus_textfile_dir:
+            return
+
+        try:
+            # Create directory if it doesn't exist
+            os.makedirs(self.prometheus_textfile_dir, exist_ok=True)
+
+            # Temporary file path
+            textfile_path = os.path.join(self.prometheus_textfile_dir, "url_monitor.prom")
+            temp_file_path = textfile_path + ".tmp"
+
+            with open(temp_file_path, 'w') as f:
+                # Write metrics header
+                f.write("# HELP url_monitor_up Whether the URL is responding successfully (1 = up, 0 = down)\n")
+                f.write("# TYPE url_monitor_up gauge\n")
+
+                f.write("# HELP url_monitor_response_time_seconds HTTP response time in seconds\n")
+                f.write("# TYPE url_monitor_response_time_seconds gauge\n")
+
+                f.write("# HELP url_monitor_status_code HTTP status code returned\n")
+                f.write("# TYPE url_monitor_status_code gauge\n")
+
+                f.write("# HELP url_monitor_consecutive_failures Number of consecutive failures\n")
+                f.write("# TYPE url_monitor_consecutive_failures gauge\n")
+
+                # Write metrics for each URL
+                for url in self.urls:
+                    # Sanitize URL for label
+                    url_label = url.replace('"', '\\"')
+
+                    # Get state for this URL
+                    url_state = self.state.get(url, {})
+                    is_up = 0 if url_state.get("alerted", False) else 1
+                    consecutive_failures = url_state.get("consecutive_failures", 0)
+
+                    # Write up metric
+                    f.write(f'url_monitor_up{{url="{url_label}",instance="{self.hostname}"}} {is_up}\n')
+
+                    # Write consecutive failures metric
+                    f.write(f'url_monitor_consecutive_failures{{url="{url_label}",instance="{self.hostname}"}} {consecutive_failures}\n')
+
+            # Atomically replace the old file with the new one
+            os.replace(temp_file_path, textfile_path)
+            logger.debug(f"Wrote Prometheus metrics to {textfile_path}")
+
+        except Exception as e:
+            logger.error(f"Failed to write Prometheus metrics: {e}")
 
     def check_ssl_certificate(self, hostname: str, port: int = 443) -> Optional[str]:
         """
@@ -586,6 +641,9 @@ class URLMonitor:
 
         # Save state after processing all URLs
         self._save_state()
+
+        # Write Prometheus metrics if configured
+        self._write_prometheus_metrics()
 
     def run(self, daemon_mode: bool = True):
         """Run the monitoring loop continuously."""
