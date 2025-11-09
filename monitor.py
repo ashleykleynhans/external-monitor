@@ -45,6 +45,9 @@ logger = logging.getLogger(__name__)
 # Check interval in seconds (2 minutes)
 CHECK_INTERVAL = 120
 
+# Request timeout
+TIMEOUT = 30
+
 # Health check thresholds
 FAILURE_THRESHOLD = 5  # Number of consecutive failures before alerting
 RECOVERY_THRESHOLD = 2  # Number of consecutive successes before resolving
@@ -239,7 +242,7 @@ class URLMonitor:
         """
         try:
             context = ssl.create_default_context()
-            with socket.create_connection((hostname, port), timeout=10) as sock:
+            with socket.create_connection((hostname, port), timeout=TIMEOUT) as sock:
                 with context.wrap_socket(sock, server_hostname=hostname) as ssock:
                     cert = ssock.getpeercert()
                     # Certificate is valid if we get here
@@ -271,7 +274,7 @@ class URLMonitor:
             headers = {
                 'User-Agent': 'External Monitoring Tool; ExternalMonitor/v0.0.1; +https://github.com/ashleykleynhans/external-monitor'
             }
-            response = requests.get(url, timeout=10, verify=True, allow_redirects=True, headers=headers)
+            response = requests.get(url, timeout=TIMEOUT, verify=True, allow_redirects=True, headers=headers)
             result["status_code"] = response.status_code
 
             if response.status_code != 200:
@@ -337,7 +340,7 @@ class URLMonitor:
             response = requests.post(
                 pagerduty_url,
                 json=payload,
-                timeout=10,
+                timeout=TIMEOUT,
                 headers={"Content-Type": "application/json"}
             )
             if response.status_code == 202:
@@ -429,7 +432,7 @@ class URLMonitor:
             response = requests.post(
                 webhook_url,
                 json=payload,
-                timeout=10
+                timeout=TIMEOUT
             )
             logger.debug(f"Webhook response status: {response.status_code}")
             if response.status_code in (200, 204):
