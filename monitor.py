@@ -286,9 +286,9 @@ class URLMonitor:
             # Create directory if it doesn't exist
             os.makedirs(self.prometheus_textfile_dir, exist_ok=True)
 
-            # Temporary file path
+            # Write to /tmp first (always writable), then move atomically
             textfile_path = os.path.join(self.prometheus_textfile_dir, "url_monitor.prom")
-            temp_file_path = textfile_path + ".tmp"
+            temp_file_path = f"/tmp/url_monitor_{os.getpid()}.prom.tmp"
 
             with open(temp_file_path, 'w') as f:
                 # Write metrics header
@@ -320,12 +320,22 @@ class URLMonitor:
                     # Write consecutive failures metric
                     f.write(f'url_monitor_consecutive_failures{{url="{url_label}",instance="{self.hostname}"}} {consecutive_failures}\n')
 
-            # Atomically replace the old file with the new one
-            os.replace(temp_file_path, textfile_path)
-            logger.debug(f"Wrote Prometheus metrics to {textfile_path}")
+            # Atomically move the temp file to the final location
+            try:
+                os.replace(temp_file_path, textfile_path)
+                logger.debug(f"Wrote Prometheus metrics to {textfile_path}")
+            except Exception as e:
+                # Clean up temp file if move failed
+                try:
+                    os.unlink(temp_file_path)
+                except:
+                    pass
+                raise
 
         except Exception as e:
             logger.error(f"Failed to write Prometheus metrics: {e}")
+            if "Permission denied" in str(e) or "Read-only file system" in str(e):
+                logger.error(f"Please ensure {self.prometheus_textfile_dir} is writable by this process")
 
     def check_ssl_certificate(self, hostname: str, port: int = 443) -> Optional[str]:
         """

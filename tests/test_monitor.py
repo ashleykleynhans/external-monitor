@@ -1871,3 +1871,38 @@ class TestPrometheusMetrics:
 
             # Check that prometheus is mentioned in logs
             assert any("Prometheus textfile exporter enabled" in record.message for record in caplog.records)
+
+    def test_prometheus_metrics_move_fails_cleanup(self, config_file):
+        """Test that temp file is cleaned up when move fails."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Update config
+            with open(config_file, 'r') as f:
+                config = yaml.safe_load(f)
+            config['prometheus_textfile_dir'] = tmpdir
+            with open(config_file, 'w') as f:
+                yaml.dump(config, f)
+
+            monitor = URLMonitor(config_file)
+            monitor.state = {}
+
+            # Make the target file immutable to cause move to fail
+            textfile_path = os.path.join(tmpdir, "url_monitor.prom")
+
+            # Create an existing file and make directory read-only after
+            with open(textfile_path, 'w') as f:
+                f.write("test")
+            os.chmod(textfile_path, 0o444)
+            os.chmod(tmpdir, 0o555)
+
+            try:
+                # This should fail but not crash
+                monitor._write_prometheus_metrics()
+
+                # Verify temp file in /tmp was cleaned up
+                import glob
+                temp_files = glob.glob(f"/tmp/url_monitor_{os.getpid()}.prom.tmp")
+                assert len(temp_files) == 0, "Temp file should be cleaned up after failed move"
+            finally:
+                # Restore permissions for cleanup
+                os.chmod(tmpdir, 0o755)
+                os.chmod(textfile_path, 0o644)
