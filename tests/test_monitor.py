@@ -785,8 +785,12 @@ class TestMainFunction:
         mock_monitor.run.side_effect = KeyboardInterrupt()
         mock_monitor_class.return_value = mock_monitor
 
+        mock_config = {'webhook_url': 'http://test.com', 'urls': ['http://test.com']}
+
         with patch('os.path.abspath', return_value='/abs/path/config.yml'):
-            main()
+            with patch('builtins.open', mock_open(read_data='webhook_url: http://test.com')):
+                with patch('yaml.safe_load', return_value=mock_config):
+                    main()
 
         mock_monitor_class.assert_called_once()
         mock_monitor.run.assert_called_once()
@@ -801,8 +805,12 @@ class TestMainFunction:
         mock_monitor.run.return_value = None  # Normal completion
         mock_monitor_class.return_value = mock_monitor
 
+        mock_config = {'webhook_url': 'http://test.com', 'urls': ['http://test.com']}
+
         with patch('os.path.abspath', return_value='/abs/path/config.yml'):
-            main()
+            with patch('builtins.open', mock_open(read_data='webhook_url: http://test.com')):
+                with patch('yaml.safe_load', return_value=mock_config):
+                    main()
 
         mock_monitor_class.assert_called_once()
         mock_monitor.run.assert_called_once()
@@ -814,9 +822,12 @@ class TestMainFunction:
         from monitor import main
 
         mock_status.return_value = True
+        mock_config = {'webhook_url': 'http://test.com', 'urls': ['http://test.com']}
 
         with patch('os.path.abspath', return_value='/abs/path/config.yml'):
-            main()
+            with patch('builtins.open', mock_open(read_data='webhook_url: http://test.com')):
+                with patch('yaml.safe_load', return_value=mock_config):
+                    main()
 
         mock_status.assert_called_once()
 
@@ -827,9 +838,12 @@ class TestMainFunction:
         from monitor import main
 
         mock_stop.return_value = True
+        mock_config = {'webhook_url': 'http://test.com', 'urls': ['http://test.com']}
 
         with patch('os.path.abspath', return_value='/abs/path/config.yml'):
-            main()
+            with patch('builtins.open', mock_open(read_data='webhook_url: http://test.com')):
+                with patch('yaml.safe_load', return_value=mock_config):
+                    main()
 
         mock_stop.assert_called_once()
 
@@ -845,11 +859,14 @@ class TestMainFunction:
         mock_stop.return_value = True
         mock_monitor = MagicMock()
         mock_monitor_class.return_value = mock_monitor
+        mock_config = {'webhook_url': 'http://test.com', 'urls': ['http://test.com']}
 
         with patch('os.path.abspath', return_value='/abs/path/config.yml'):
-            # Mock run to exit immediately
-            mock_monitor.run.return_value = None
-            main()
+            with patch('builtins.open', mock_open(read_data='webhook_url: http://test.com')):
+                with patch('yaml.safe_load', return_value=mock_config):
+                    # Mock run to exit immediately
+                    mock_monitor.run.return_value = None
+                    main()
 
         mock_stop.assert_called_once()
         mock_daemonize.assert_called_once()
@@ -865,9 +882,12 @@ class TestMainFunction:
         mock_monitor = MagicMock()
         mock_monitor_class.return_value = mock_monitor
         mock_monitor.run.return_value = None
+        mock_config = {'webhook_url': 'http://test.com', 'urls': ['http://test.com']}
 
         with patch('os.path.abspath', return_value='/abs/path/config.yml'):
-            main()
+            with patch('builtins.open', mock_open(read_data='webhook_url: http://test.com')):
+                with patch('yaml.safe_load', return_value=mock_config):
+                    main()
 
         mock_daemonize.assert_called_once()
         mock_monitor_class.assert_called_once()
@@ -882,10 +902,13 @@ class TestMainFunction:
         mock_monitor = MagicMock()
         mock_monitor.run.side_effect = Exception("Test error")
         mock_monitor_class.return_value = mock_monitor
+        mock_config = {'webhook_url': 'http://test.com', 'urls': ['http://test.com']}
 
         with patch('os.path.abspath', return_value='/abs/path/config.yml'):
-            with pytest.raises(Exception):
-                main()
+            with patch('builtins.open', mock_open(read_data='webhook_url: http://test.com')):
+                with patch('yaml.safe_load', return_value=mock_config):
+                    with pytest.raises(Exception):
+                        main()
 
     @patch('sys.argv', ['monitor.py', 'start'])
     @patch('monitor.daemonize')
@@ -897,10 +920,13 @@ class TestMainFunction:
         mock_monitor = MagicMock()
         mock_monitor.run.side_effect = Exception("Fatal error")
         mock_monitor_class.return_value = mock_monitor
+        mock_config = {'webhook_url': 'http://test.com', 'urls': ['http://test.com']}
 
         with patch('os.path.abspath', return_value='/abs/path/config.yml'):
-            with pytest.raises(Exception):
-                main()
+            with patch('builtins.open', mock_open(read_data='webhook_url: http://test.com')):
+                with patch('yaml.safe_load', return_value=mock_config):
+                    with pytest.raises(Exception):
+                        main()
 
     @patch('sys.argv', ['monitor.py', 'restart'])
     @patch('monitor.stop_daemon')
@@ -915,10 +941,24 @@ class TestMainFunction:
         mock_monitor = MagicMock()
         mock_monitor.run.side_effect = Exception("Fatal error")
         mock_monitor_class.return_value = mock_monitor
+        mock_config = {'webhook_url': 'http://test.com', 'urls': ['http://test.com']}
 
         with patch('os.path.abspath', return_value='/abs/path/config.yml'):
-            with pytest.raises(Exception):
-                main()
+            with patch('builtins.open', mock_open(read_data='webhook_url: http://test.com')):
+                with patch('yaml.safe_load', return_value=mock_config):
+                    with pytest.raises(Exception):
+                        main()
+
+    @patch('sys.argv', ['monitor.py', 'start'])
+    def test_main_config_load_error(self):
+        """Test main with config loading error."""
+        from monitor import main
+
+        with patch('os.path.abspath', return_value='/abs/path/config.yml'):
+            with patch('builtins.open', side_effect=FileNotFoundError("Config not found")):
+                with pytest.raises(SystemExit) as exc_info:
+                    main()
+                assert exc_info.value.code == 1
 
 
 class TestNotificationEdgeCases:

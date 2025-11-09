@@ -42,21 +42,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Check interval in seconds (2 minutes)
-CHECK_INTERVAL = 120
-
-# Request timeout
-TIMEOUT = 30
-
-# Health check thresholds
-FAILURE_THRESHOLD = 5  # Number of consecutive failures before alerting
-RECOVERY_THRESHOLD = 2  # Number of consecutive successes before resolving
-RETRY_INTERVAL = 5  # Seconds between retries for failed checks
-
-# Daemon configuration
-PID_FILE = "/tmp/url_monitor.pid"
-LOG_FILE = "/tmp/url_monitor.log"
-STATE_FILE = "/tmp/url_monitor_state.json"
+# Default configuration values
+DEFAULT_CHECK_INTERVAL = 120  # Check interval in seconds (2 minutes)
+DEFAULT_TIMEOUT = 30  # Request timeout
+DEFAULT_FAILURE_THRESHOLD = 5  # Number of consecutive failures before alerting
+DEFAULT_RECOVERY_THRESHOLD = 2  # Number of consecutive successes before resolving
+DEFAULT_RETRY_INTERVAL = 5  # Seconds between retries for failed checks
+DEFAULT_PID_FILE = "/tmp/url_monitor.pid"
+DEFAULT_LOG_FILE = "/tmp/url_monitor.log"
+DEFAULT_STATE_FILE = "/tmp/url_monitor_state.json"
 
 # Global flag for graceful shutdown
 shutdown_requested = False
@@ -180,14 +174,23 @@ def daemonize(pid_file: str, log_file: str):  # pragma: no cover
 class URLMonitor:
     """Monitor URLs for availability and SSL certificate validity."""
 
-    def __init__(self, config_path: str = "config.yml", state_file: str = STATE_FILE):
+    def __init__(self, config_path: str = "config.yml", state_file: str = None):
         """Initialize the monitor with configuration."""
         self.config = self._load_config(config_path)
         self.webhook_url = self.config.get("webhook_url")
         self.pagerduty_key = self.config.get("pagerduty_integration_key")
         self.urls = self.config.get("urls", [])
         self.hostname = socket.gethostname()
-        self.state_file = state_file
+
+        # Load configurable values with defaults
+        self.check_interval = self.config.get("check_interval", DEFAULT_CHECK_INTERVAL)
+        self.timeout = self.config.get("timeout", DEFAULT_TIMEOUT)
+        self.failure_threshold = self.config.get("failure_threshold", DEFAULT_FAILURE_THRESHOLD)
+        self.recovery_threshold = self.config.get("recovery_threshold", DEFAULT_RECOVERY_THRESHOLD)
+        self.retry_interval = self.config.get("retry_interval", DEFAULT_RETRY_INTERVAL)
+
+        # Use state_file parameter if provided, otherwise use config, otherwise use default
+        self.state_file = state_file if state_file is not None else self.config.get("state_file", DEFAULT_STATE_FILE)
         self.state = self._load_state()
 
         if not self.webhook_url:
@@ -197,6 +200,8 @@ class URLMonitor:
 
         logger.info(f"Initialized monitor on host: {self.hostname}")
         logger.info(f"Monitoring {len(self.urls)} URL(s)")
+        logger.info(f"Check interval: {self.check_interval}s, Timeout: {self.timeout}s")
+        logger.info(f"Thresholds - Failure: {self.failure_threshold}, Recovery: {self.recovery_threshold}")
         if self.pagerduty_key:
             logger.info("PagerDuty backup notifications enabled")
 
@@ -242,7 +247,7 @@ class URLMonitor:
         """
         try:
             context = ssl.create_default_context()
-            with socket.create_connection((hostname, port), timeout=TIMEOUT) as sock:
+            with socket.create_connection((hostname, port), timeout=self.timeout) as sock:
                 with context.wrap_socket(sock, server_hostname=hostname) as ssock:
                     cert = ssock.getpeercert()
                     # Certificate is valid if we get here
@@ -274,7 +279,7 @@ class URLMonitor:
             headers = {
                 'User-Agent': 'External Monitoring Tool; ExternalMonitor/v0.0.1; +https://github.com/ashleykleynhans/external-monitor'
             }
-            response = requests.get(url, timeout=TIMEOUT, verify=True, allow_redirects=True, headers=headers)
+            response = requests.get(url, timeout=self.timeout, verify=True, allow_redirects=True, headers=headers)
             result["status_code"] = response.status_code
 
             if response.status_code != 200:
@@ -340,7 +345,7 @@ class URLMonitor:
             response = requests.post(
                 pagerduty_url,
                 json=payload,
-                timeout=TIMEOUT,
+                timeout=self.timeout,
                 headers={"Content-Type": "application/json"}
             )
             if response.status_code == 202:
@@ -432,7 +437,7 @@ class URLMonitor:
             response = requests.post(
                 webhook_url,
                 json=payload,
-                timeout=TIMEOUT
+                timeout=self.timeout
             )
             logger.debug(f"Webhook response status: {response.status_code}")
             if response.status_code in (200, 204):
@@ -467,11 +472,11 @@ class URLMonitor:
             result = self.check_url(url)
             retry_count = 1  # Track number of attempts made
 
-            # If initial check fails, retry up to FAILURE_THRESHOLD times
+            # If initial check fails, retry up to failure_threshold times
             if not result["success"]:
-                while retry_count < FAILURE_THRESHOLD and not result["success"]:
-                    logger.info(f"Retry {retry_count}/{FAILURE_THRESHOLD-1} for {url} in {RETRY_INTERVAL}s...")
-                    time.sleep(RETRY_INTERVAL)
+                while retry_count < self.failure_threshold and not result["success"]:
+                    logger.info(f"Retry {retry_count}/{self.failure_threshold-1} for {url} in {self.retry_interval}s...")
+                    time.sleep(self.retry_interval)
                     result = self.check_url(url)
                     retry_count += 1
 
@@ -483,7 +488,7 @@ class URLMonitor:
                 consecutive_successes += 1
 
                 # Check if we should send a resolved alert
-                if is_alerted and consecutive_successes >= RECOVERY_THRESHOLD:
+                if is_alerted and consecutive_successes >= self.recovery_threshold:
                     logger.info(f"URL recovered after {consecutive_successes} successful checks: {url}")
                     self.send_discord_notification(url, {}, status="resolved")
                     # Mark as no longer alerted
@@ -493,7 +498,7 @@ class URLMonitor:
                         "alerted": False
                     }
                 elif is_alerted:
-                    logger.info(f"URL passing ({consecutive_successes}/{RECOVERY_THRESHOLD} needed for recovery): {url}")
+                    logger.info(f"URL passing ({consecutive_successes}/{self.recovery_threshold} needed for recovery): {url}")
                     self.state[url] = {
                         "consecutive_failures": 0,
                         "consecutive_successes": consecutive_successes,
@@ -513,8 +518,8 @@ class URLMonitor:
                 # Reset success counter
                 consecutive_successes = 0
 
-                # After retry loop, all FAILURE_THRESHOLD attempts failed
-                consecutive_failures = FAILURE_THRESHOLD
+                # After retry loop, all failure_threshold attempts failed
+                consecutive_failures = self.failure_threshold
 
                 # Determine severity for state tracking
                 severity = "critical"
@@ -560,7 +565,7 @@ class URLMonitor:
         if daemon_mode:
             signal.signal(signal.SIGINT, signal_handler)
 
-        logger.info(f"Starting monitoring loop (check every {CHECK_INTERVAL}s)...")
+        logger.info(f"Starting monitoring loop (check every {self.check_interval}s)...")
 
         while not shutdown_requested:
             try:
@@ -569,7 +574,7 @@ class URLMonitor:
                 logger.error(f"Error in monitoring loop: {e}")
 
             # Sleep in small increments to allow for responsive shutdown
-            for _ in range(CHECK_INTERVAL):
+            for _ in range(self.check_interval):
                 if shutdown_requested:
                     break
                 time.sleep(1)
@@ -646,13 +651,13 @@ def main():
     )
     parser.add_argument(
         '--pid-file',
-        default=PID_FILE,
-        help=f'Path to PID file (default: {PID_FILE})'
+        default=None,
+        help=f'Path to PID file (default: value from config or {DEFAULT_PID_FILE})'
     )
     parser.add_argument(
         '--log-file',
-        default=LOG_FILE,
-        help=f'Path to log file (default: {LOG_FILE})'
+        default=None,
+        help=f'Path to log file (default: value from config or {DEFAULT_LOG_FILE})'
     )
 
     args = parser.parse_args()
@@ -661,9 +666,21 @@ def main():
     # (daemon changes working directory to /)
     args.config = os.path.abspath(args.config)
 
+    # Load config to get pid_file and log_file if not specified via command line
+    try:
+        with open(args.config, 'r') as f:
+            config = yaml.safe_load(f)
+    except Exception as e:
+        print(f"Error loading config file: {e}")
+        sys.exit(1)
+
+    # Use command line args if provided, otherwise use config values, otherwise use defaults
+    pid_file = args.pid_file if args.pid_file is not None else config.get('pid_file', DEFAULT_PID_FILE)
+    log_file = args.log_file if args.log_file is not None else config.get('log_file', DEFAULT_LOG_FILE)
+
     if args.command == 'start':
         print("Starting daemon...")
-        daemonize(args.pid_file, args.log_file)
+        daemonize(pid_file, log_file)
         try:
             monitor = URLMonitor(args.config)
             monitor.run()
@@ -672,14 +689,14 @@ def main():
             raise
 
     elif args.command == 'stop':
-        stop_daemon(args.pid_file)
+        stop_daemon(pid_file)
 
     elif args.command == 'restart':
         print("Restarting daemon...")
-        stop_daemon(args.pid_file)
+        stop_daemon(pid_file)
         time.sleep(2)
         print("Starting daemon...")
-        daemonize(args.pid_file, args.log_file)
+        daemonize(pid_file, log_file)
         try:
             monitor = URLMonitor(args.config)
             monitor.run()
@@ -688,7 +705,7 @@ def main():
             raise
 
     elif args.command == 'status':
-        status_daemon(args.pid_file)
+        status_daemon(pid_file)
 
     elif args.command == 'foreground':
         print("Running in foreground mode (Ctrl+C to stop)...")

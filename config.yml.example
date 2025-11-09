@@ -10,3 +10,15 @@ urls:
   - "https://example.com"
   - "https://www.google.com"
   - "https://api.github.com"
+
+# Monitoring configuration (optional - defaults shown below)
+# check_interval: 120  # Check interval in seconds (2 minutes)
+# timeout: 30  # Request timeout in seconds
+# failure_threshold: 5  # Number of consecutive failures before alerting
+# recovery_threshold: 2  # Number of consecutive successes before resolving
+# retry_interval: 5  # Seconds between retries for failed checks
+
+# Daemon configuration (optional - defaults shown below)
+# pid_file: "/tmp/url_monitor.pid"
+# log_file: "/tmp/url_monitor.log"
+# state_file: "/tmp/url_monitor_state.json"
