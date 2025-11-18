@@ -31,6 +31,10 @@ webhook_url: "https://discord.com/api/webhooks/test/webhook"
 urls:
   - "https://example.com"
   - "https://test.com"
+failure_threshold: 5
+recovery_threshold: 2
+alert_cooldown: 0
+suppress_resolved: false
 """
     with tempfile.NamedTemporaryFile(mode='w', suffix='.yml', delete=False) as f:
         f.write(config_content)
@@ -1906,3 +1910,229 @@ class TestPrometheusMetrics:
                 # Restore permissions for cleanup
                 os.chmod(tmpdir, 0o755)
                 os.chmod(textfile_path, 0o644)
+
+    @patch('monitor.time.sleep')
+    @patch('monitor.URLMonitor.check_url')
+    @patch('monitor.URLMonitor.send_discord_notification')
+    def test_alert_cooldown_prevents_rapid_alerts(self, mock_notify, mock_check, mock_sleep, state_file):
+        """Test that alert cooldown prevents re-alerting during the cooldown period."""
+        # Create config with short cooldown for testing
+        config_content = """
+webhook_url: "https://discord.com/api/webhooks/test/webhook"
+urls:
+  - "https://example.com"
+failure_threshold: 5
+recovery_threshold: 2
+alert_cooldown: 300
+suppress_resolved: false
+"""
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.yml', delete=False) as f:
+            f.write(config_content)
+            config_path = f.name
+
+        try:
+            monitor = URLMonitor(config_path, state_file)
+
+            # First failure - should send alert
+            mock_check.return_value = {
+                "success": False,
+                "status_code": 500,
+                "error": "Internal Server Error",
+                "ssl_error": None
+            }
+            monitor.monitor_once()
+            assert mock_notify.call_count == 1
+
+            # Recovery
+            mock_notify.reset_mock()
+            mock_check.return_value = {
+                "success": True,
+                "status_code": 200,
+                "error": None,
+                "ssl_error": None
+            }
+            monitor.monitor_once()  # 1st success
+            monitor.monitor_once()  # 2nd success - triggers resolved
+            assert mock_notify.call_count == 1  # Resolved alert
+
+            # Fail again immediately - should NOT send alert (in cooldown)
+            mock_notify.reset_mock()
+            mock_check.return_value = {
+                "success": False,
+                "status_code": 500,
+                "error": "Internal Server Error",
+                "ssl_error": None
+            }
+            monitor.monitor_once()
+            assert mock_notify.call_count == 0  # No alert due to cooldown
+
+        finally:
+            os.unlink(config_path)
+
+    @patch('monitor.time.sleep')
+    @patch('monitor.URLMonitor.check_url')
+    @patch('monitor.URLMonitor.send_discord_notification')
+    def test_alert_cooldown_allows_after_period(self, mock_notify, mock_check, mock_sleep, state_file):
+        """Test that alerts are sent after cooldown period expires."""
+        from datetime import datetime, timedelta
+
+        config_content = """
+webhook_url: "https://discord.com/api/webhooks/test/webhook"
+urls:
+  - "https://example.com"
+failure_threshold: 5
+recovery_threshold: 2
+alert_cooldown: 300
+suppress_resolved: false
+"""
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.yml', delete=False) as f:
+            f.write(config_content)
+            config_path = f.name
+
+        try:
+            monitor = URLMonitor(config_path, state_file)
+
+            # Set up state with an old alert time (beyond cooldown)
+            old_time = (datetime.now() - timedelta(seconds=400)).isoformat()
+            monitor.state["https://example.com"] = {
+                "alerted": False,
+                "consecutive_failures": 0,
+                "consecutive_successes": 0,
+                "last_alert_time": old_time
+            }
+            monitor._save_state()
+
+            # Fail - should send alert (cooldown expired)
+            mock_check.return_value = {
+                "success": False,
+                "status_code": 500,
+                "error": "Internal Server Error",
+                "ssl_error": None
+            }
+            monitor.monitor_once()
+            assert mock_notify.call_count == 1  # Alert sent after cooldown
+
+        finally:
+            os.unlink(config_path)
+
+    @patch('monitor.time.sleep')
+    @patch('monitor.URLMonitor.check_url')
+    @patch('monitor.URLMonitor.send_discord_notification')
+    def test_suppress_resolved_alerts(self, mock_notify, mock_check, mock_sleep, state_file):
+        """Test that suppress_resolved prevents sending resolved alerts."""
+        config_content = """
+webhook_url: "https://discord.com/api/webhooks/test/webhook"
+urls:
+  - "https://example.com"
+failure_threshold: 5
+recovery_threshold: 2
+alert_cooldown: 0
+suppress_resolved: true
+"""
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.yml', delete=False) as f:
+            f.write(config_content)
+            config_path = f.name
+
+        try:
+            monitor = URLMonitor(config_path, state_file)
+
+            # Failure - should send alert
+            mock_check.return_value = {
+                "success": False,
+                "status_code": 500,
+                "error": "Internal Server Error",
+                "ssl_error": None
+            }
+            monitor.monitor_once()
+            assert mock_notify.call_count == 1
+            assert mock_notify.call_args[1]['status'] == 'firing'
+
+            # Recovery - should NOT send resolved alert
+            mock_notify.reset_mock()
+            mock_check.return_value = {
+                "success": True,
+                "status_code": 200,
+                "error": None,
+                "ssl_error": None
+            }
+            monitor.monitor_once()  # 1st success
+            monitor.monitor_once()  # 2nd success
+            assert mock_notify.call_count == 0  # No resolved alert
+
+        finally:
+            os.unlink(config_path)
+
+    def test_default_configuration_values(self):
+        """Test that new configuration values have proper defaults."""
+        config_content = """
+webhook_url: "https://discord.com/api/webhooks/test/webhook"
+urls:
+  - "https://example.com"
+"""
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.yml', delete=False) as f:
+            f.write(config_content)
+            config_path = f.name
+
+        try:
+            monitor = URLMonitor(config_path)
+            assert monitor.failure_threshold == 10
+            assert monitor.recovery_threshold == 5
+            assert monitor.alert_cooldown == 1800
+            assert monitor.suppress_resolved is False
+
+        finally:
+            os.unlink(config_path)
+
+    @patch('monitor.os.unlink')
+    @patch('monitor.shutil.move')
+    def test_prometheus_metrics_cleanup_failure_ignored(self, mock_move, mock_unlink, config_file):
+        """Test that temp file cleanup failure is silently ignored."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Update config
+            with open(config_file, 'r') as f:
+                config = yaml.safe_load(f)
+            config['prometheus_textfile_dir'] = tmpdir
+            with open(config_file, 'w') as f:
+                yaml.dump(config, f)
+
+            monitor = URLMonitor(config_file)
+            monitor.state = {}
+
+            # Make move fail with an exception
+            mock_move.side_effect = PermissionError("Permission denied")
+            # Make unlink also fail - this should be caught and ignored
+            mock_unlink.side_effect = OSError("Cannot delete file")
+
+            # This should log the error but not crash
+            monitor._write_prometheus_metrics()
+
+            # Verify unlink was attempted (covers line 337)
+            assert mock_unlink.called
+
+    def test_prometheus_metrics_permission_denied_message(self, config_file, caplog):
+        """Test that permission denied error shows helpful message."""
+        import logging
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Update config
+            with open(config_file, 'r') as f:
+                config = yaml.safe_load(f)
+            config['prometheus_textfile_dir'] = tmpdir
+            with open(config_file, 'w') as f:
+                yaml.dump(config, f)
+
+            monitor = URLMonitor(config_file)
+            monitor.state = {}
+
+            # Make directory read-only to cause permission error
+            os.chmod(tmpdir, 0o555)
+
+            try:
+                with caplog.at_level(logging.ERROR):
+                    monitor._write_prometheus_metrics()
+
+                # Check that the helpful permission message was logged (covers line 343)
+                assert any("Please ensure" in record.message and "writable" in record.message for record in caplog.records)
+                assert any("Permission denied" in record.message or "Read-only" in record.message for record in caplog.records)
+            finally:
+                # Restore permissions
+                os.chmod(tmpdir, 0o755)

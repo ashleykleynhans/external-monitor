@@ -46,9 +46,11 @@ logger = logging.getLogger(__name__)
 # Default configuration values
 DEFAULT_CHECK_INTERVAL = 120  # Check interval in seconds (2 minutes)
 DEFAULT_TIMEOUT = 30  # Request timeout
-DEFAULT_FAILURE_THRESHOLD = 5  # Number of consecutive failures before alerting
-DEFAULT_RECOVERY_THRESHOLD = 2  # Number of consecutive successes before resolving
+DEFAULT_FAILURE_THRESHOLD = 10  # Number of consecutive failures before alerting (increased from 5)
+DEFAULT_RECOVERY_THRESHOLD = 5  # Number of consecutive successes before resolving (increased from 2)
 DEFAULT_RETRY_INTERVAL = 5  # Seconds between retries for failed checks
+DEFAULT_ALERT_COOLDOWN = 1800  # Cooldown period in seconds before re-alerting (30 minutes)
+DEFAULT_SUPPRESS_RESOLVED = False  # Whether to suppress resolved alerts during flapping
 DEFAULT_PID_FILE = "/tmp/url_monitor.pid"
 DEFAULT_LOG_FILE = "/tmp/url_monitor.log"
 DEFAULT_STATE_FILE = "/tmp/url_monitor_state.json"
@@ -221,6 +223,8 @@ class URLMonitor:
         self.failure_threshold = self.config.get("failure_threshold", DEFAULT_FAILURE_THRESHOLD)
         self.recovery_threshold = self.config.get("recovery_threshold", DEFAULT_RECOVERY_THRESHOLD)
         self.retry_interval = self.config.get("retry_interval", DEFAULT_RETRY_INTERVAL)
+        self.alert_cooldown = self.config.get("alert_cooldown", DEFAULT_ALERT_COOLDOWN)
+        self.suppress_resolved = self.config.get("suppress_resolved", DEFAULT_SUPPRESS_RESOLVED)
 
         # Use state_file parameter if provided, otherwise use config, otherwise use default
         self.state_file = state_file if state_file is not None else self.config.get("state_file", DEFAULT_STATE_FILE)
@@ -238,6 +242,7 @@ class URLMonitor:
         logger.info(f"Monitoring {len(self.urls)} URL(s)")
         logger.info(f"Check interval: {self.check_interval}s, Timeout: {self.timeout}s")
         logger.info(f"Thresholds - Failure: {self.failure_threshold}, Recovery: {self.recovery_threshold}")
+        logger.info(f"Alert cooldown: {self.alert_cooldown}s, Suppress resolved alerts: {self.suppress_resolved}")
         if self.pagerduty_key:
             logger.info("PagerDuty backup notifications enabled")
         if self.prometheus_textfile_dir:
@@ -565,6 +570,7 @@ class URLMonitor:
             consecutive_failures = previous_state.get("consecutive_failures", 0)
             consecutive_successes = previous_state.get("consecutive_successes", 0)
             is_alerted = previous_state.get("alerted", False)
+            last_alert_time = previous_state.get("last_alert_time")
 
             # Perform initial check
             result = self.check_url(url)
@@ -588,12 +594,17 @@ class URLMonitor:
                 # Check if we should send a resolved alert
                 if is_alerted and consecutive_successes >= self.recovery_threshold:
                     logger.info(f"URL recovered after {consecutive_successes} successful checks: {url}")
-                    self.send_discord_notification(url, {}, status="resolved")
+                    # Send resolved alert unless suppression is enabled
+                    if not self.suppress_resolved:
+                        self.send_discord_notification(url, {}, status="resolved")
+                    else:
+                        logger.info(f"Resolved alert suppressed for {url} (suppress_resolved=True)")
                     # Mark as no longer alerted
                     self.state[url] = {
                         "consecutive_failures": 0,
                         "consecutive_successes": consecutive_successes,
-                        "alerted": False
+                        "alerted": False,
+                        "last_alert_time": last_alert_time  # Preserve for cooldown
                     }
                 elif is_alerted:
                     logger.info(f"URL passing ({consecutive_successes}/{self.recovery_threshold} needed for recovery): {url}")
@@ -601,14 +612,16 @@ class URLMonitor:
                         "consecutive_failures": 0,
                         "consecutive_successes": consecutive_successes,
                         "alerted": True,
-                        "severity": previous_state.get("severity", "critical")
+                        "severity": previous_state.get("severity", "critical"),
+                        "last_alert_time": last_alert_time
                     }
                 else:
                     # Just update state without alert
                     self.state[url] = {
                         "consecutive_failures": 0,
                         "consecutive_successes": consecutive_successes,
-                        "alerted": False
+                        "alerted": False,
+                        "last_alert_time": last_alert_time
                     }
             else:
                 logger.warning(f"FAIL: {url} - {result.get('error', 'Unknown error')}")
@@ -628,8 +641,27 @@ class URLMonitor:
                 elif result.get("status_code") and result["status_code"] >= 400:
                     severity = "warning"
 
-                # Send alert if not already alerted
+                # Check if we should send alert (not already alerted OR cooldown period has passed)
+                should_alert = False
+                current_time = datetime.now()
+
                 if not is_alerted:
+                    # Check if we're still in cooldown from a previous alert
+                    if last_alert_time:
+                        last_alert_dt = datetime.fromisoformat(last_alert_time.replace('Z', '+00:00'))
+                        time_since_alert = (current_time - last_alert_dt).total_seconds()
+
+                        if time_since_alert >= self.alert_cooldown:
+                            should_alert = True
+                            logger.info(f"Cooldown period elapsed ({time_since_alert:.0f}s >= {self.alert_cooldown}s), will send alert")
+                        else:
+                            remaining = self.alert_cooldown - time_since_alert
+                            logger.info(f"URL failing but still in cooldown period ({remaining:.0f}s remaining): {url}")
+                    else:
+                        # No previous alert, send immediately
+                        should_alert = True
+
+                if should_alert:
                     logger.warning(f"URL failed {consecutive_failures} consecutive times, sending alert: {url}")
                     self.send_discord_notification(url, result, status="firing")
                     self.state[url] = {
@@ -637,17 +669,20 @@ class URLMonitor:
                         "consecutive_successes": 0,
                         "alerted": True,
                         "severity": severity,
-                        "first_failure": datetime.now().isoformat()
+                        "first_failure": current_time.isoformat(),
+                        "last_alert_time": current_time.isoformat()
                     }
                 else:
-                    # Already alerted, just track failures
-                    logger.debug(f"URL still failing (already alerted): {url}")
+                    # Already alerted or in cooldown, just track failures
+                    if is_alerted:
+                        logger.debug(f"URL still failing (already alerted): {url}")
                     self.state[url] = {
                         "consecutive_failures": consecutive_failures,
                         "consecutive_successes": 0,
-                        "alerted": True,
+                        "alerted": is_alerted,
                         "severity": severity,
-                        "first_failure": previous_state.get("first_failure", datetime.now().isoformat())
+                        "first_failure": previous_state.get("first_failure", current_time.isoformat()),
+                        "last_alert_time": last_alert_time
                     }
 
         # Save state after processing all URLs

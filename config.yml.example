@@ -14,9 +14,13 @@ urls:
 # Monitoring configuration (optional - defaults shown below)
 # check_interval: 120  # Check interval in seconds (2 minutes)
 # timeout: 30  # Request timeout in seconds
-# failure_threshold: 5  # Number of consecutive failures before alerting
-# recovery_threshold: 2  # Number of consecutive successes before resolving
+# failure_threshold: 10  # Number of consecutive failures before alerting
+# recovery_threshold: 5  # Number of consecutive successes before resolving
 # retry_interval: 5  # Seconds between retries for failed checks
+
+# Alert spam reduction settings (optional - defaults shown below)
+# alert_cooldown: 1800  # Cooldown period in seconds before re-alerting (30 minutes)
+# suppress_resolved: false  # Set to true to suppress resolved alerts during flapping
 
 # Daemon configuration (optional - defaults shown below)
 # pid_file: "/tmp/url_monitor.pid"
