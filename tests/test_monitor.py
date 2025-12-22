@@ -2136,3 +2136,28 @@ urls:
             finally:
                 # Restore permissions
                 os.chmod(tmpdir, 0o755)
+
+    def test_prometheus_metrics_generic_error_no_permission_message(self, config_file, caplog):
+        """Test that generic errors (not permission-related) don't show permission advice."""
+        import logging
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Update config
+            with open(config_file, 'r') as f:
+                config = yaml.safe_load(f)
+            config['prometheus_textfile_dir'] = tmpdir
+            with open(config_file, 'w') as f:
+                yaml.dump(config, f)
+
+            monitor = URLMonitor(config_file)
+            monitor.state = {}
+
+            # Mock shutil.move to raise a generic exception (not permission-related)
+            with patch('shutil.move', side_effect=OSError("Disk quota exceeded")):
+                with caplog.at_level(logging.ERROR):
+                    monitor._write_prometheus_metrics()
+
+                # Check that the error was logged
+                assert any("Failed to write Prometheus metrics" in record.message for record in caplog.records)
+                assert any("Disk quota exceeded" in record.message for record in caplog.records)
+                # Check that the permission advice was NOT logged (covers line 345->exit)
+                assert not any("Please ensure" in record.message and "writable" in record.message for record in caplog.records)

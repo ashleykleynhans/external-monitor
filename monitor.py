@@ -48,7 +48,8 @@ DEFAULT_CHECK_INTERVAL = 120  # Check interval in seconds (2 minutes)
 DEFAULT_TIMEOUT = 30  # Request timeout
 DEFAULT_FAILURE_THRESHOLD = 10  # Number of consecutive failures before alerting (increased from 5)
 DEFAULT_RECOVERY_THRESHOLD = 5  # Number of consecutive successes before resolving (increased from 2)
-DEFAULT_RETRY_INTERVAL = 5  # Seconds between retries for failed checks
+DEFAULT_RETRY_INTERVAL = 5  # Initial seconds between retries for failed checks
+DEFAULT_MAX_RETRY_INTERVAL = 60  # Maximum seconds between retries (exponential backoff cap)
 DEFAULT_ALERT_COOLDOWN = 1800  # Cooldown period in seconds before re-alerting (30 minutes)
 DEFAULT_SUPPRESS_RESOLVED = False  # Whether to suppress resolved alerts during flapping
 DEFAULT_PID_FILE = "/tmp/url_monitor.pid"
@@ -223,6 +224,7 @@ class URLMonitor:
         self.failure_threshold = self.config.get("failure_threshold", DEFAULT_FAILURE_THRESHOLD)
         self.recovery_threshold = self.config.get("recovery_threshold", DEFAULT_RECOVERY_THRESHOLD)
         self.retry_interval = self.config.get("retry_interval", DEFAULT_RETRY_INTERVAL)
+        self.max_retry_interval = self.config.get("max_retry_interval", DEFAULT_MAX_RETRY_INTERVAL)
         self.alert_cooldown = self.config.get("alert_cooldown", DEFAULT_ALERT_COOLDOWN)
         self.suppress_resolved = self.config.get("suppress_resolved", DEFAULT_SUPPRESS_RESOLVED)
 
@@ -576,11 +578,13 @@ class URLMonitor:
             result = self.check_url(url)
             retry_count = 1  # Track number of attempts made
 
-            # If initial check fails, retry up to failure_threshold times
+            # If initial check fails, retry up to failure_threshold times with exponential backoff
             if not result["success"]:
                 while retry_count < self.failure_threshold and not result["success"]:
-                    logger.info(f"Retry {retry_count}/{self.failure_threshold-1} for {url} in {self.retry_interval}s...")
-                    time.sleep(self.retry_interval)
+                    # Exponential backoff: delay doubles each retry, capped at max_retry_interval
+                    backoff_delay = min(self.retry_interval * (2 ** (retry_count - 1)), self.max_retry_interval)
+                    logger.info(f"Retry {retry_count}/{self.failure_threshold-1} for {url} in {backoff_delay}s...")
+                    time.sleep(backoff_delay)
                     result = self.check_url(url)
                     retry_count += 1
 
