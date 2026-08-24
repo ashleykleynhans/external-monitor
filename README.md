@@ -8,10 +8,18 @@ configured endpoints at regular intervals and sends alerts to Alertmanager via w
 - Monitor multiple URLs at configurable intervals (default: 2 minutes)
 - SSL certificate validation
 - HTTP status code checking with automatic redirect following
-- Health check thresholds with automatic retries (5 failures before alerting, 2 successes for recovery)
+- False positive reduction - failures are confirmed across separate check cycles
+  before alerting, so brief transient blips never page anyone
+- DNS failure verification against public resolvers (DNS over HTTPS) to avoid
+  alerting when the local network (not the target) is broken
+- HTTP 429 responses treated as indeterminate rather than failures
+- Per-URL configuration: expected status codes, custom headers, and timeouts
+- Maintenance windows and a sentinel file to pause monitoring entirely
+- Health check thresholds (default: 3 consecutive failing cycles before
+  alerting, 2 successful cycles for recovery)
 - Alert deduplication - alerts only sent on state changes (OK→FAIL, FAIL→OK)
 - Resolved alerts sent automatically when URLs recover
-- State persistence across daemon restarts
+- State persistence across daemon restarts (`/var/lib/external-monitor/state.json`)
 - Alertmanager-compatible webhook notifications
 - PagerDuty backup notifications (automatic failover when Alertmanager is down)
 - Automatic severity classification (critical for 5xx/SSL errors, warning for 4xx)
@@ -54,7 +62,16 @@ Edit `config.yml` to specify:
 
 - `webhook_url`: Your Alertmanager webhook URL (required)
 - `pagerduty_integration_key`: Your PagerDuty Events API v2 integration key (optional - used as backup)
-- `urls`: List of URLs to monitor
+- `urls`: List of URLs to monitor. Each entry is either a plain URL string, or
+  a mapping with per-URL settings:
+  - `url` (required): the URL to check
+  - `expected_status_codes`: HTTP status codes treated as healthy (default: `[200]`)
+  - `headers`: extra HTTP headers, e.g. to get past a WAF or authenticate
+  - `timeout`: per-URL timeout override in seconds
+
+See `config.yml.example` for all available options, including false positive
+reduction settings (`dns_verification`, `maintenance_windows`,
+`maintenance_file`), thresholds, and cooldowns.
 
 Example:
 ```yaml
@@ -62,7 +79,11 @@ webhook_url: "https://your-alertmanager.com/api/v1/alerts"
 pagerduty_integration_key: "your-pagerduty-integration-key"  # Optional backup
 urls:
   - "https://example.com"
-  - "https://api.example.com"
+  - url: "https://api.example.com/health"
+    expected_status_codes: [200, 204]
+    headers:
+      Authorization: "Bearer your-token-here"
+    timeout: 10
 ```
 
 ### PagerDuty Backup Notifications (Optional)
@@ -237,7 +258,7 @@ sudo systemctl restart external-monitor
 ## Alertmanager Notifications
 
 The monitoring system sends Alertmanager-compatible alerts when:
-- A URL returns a non-200 HTTP status code
+- A URL returns an HTTP status code outside its configured `expected_status_codes`
 - SSL certificate validation fails
 - Connection errors occur
 
@@ -291,22 +312,34 @@ This is sent as a POST request to the webhook URL with the severity appended (e.
 The monitor implements intelligent alert deduplication to prevent alert fatigue:
 
 **State Tracking:**
-- The monitor maintains a persistent state file (`/tmp/url_monitor_state.json`) that tracks the current status of each URL
+- The monitor maintains a persistent state file (`/var/lib/external-monitor/state.json`) that tracks the current status of each URL
 - State persists across daemon restarts, ensuring consistent behavior
+- When installed via the provided systemd unit, `StateDirectory=external-monitor` creates and owns this directory automatically
+
+**Failure Confirmation (False Positive Reduction):**
+- Each check cycle makes exactly one attempt per URL - there are no rapid in-cycle retries
+- An alert fires only after `failure_threshold` consecutive failing *cycles* (default: 3), so brief transient blips never page anyone
+- Recovery requires `recovery_threshold` consecutive successful cycles (default: 2)
+- HTTP 429 (rate limited) responses are marked *indeterminate*: they count as neither success nor failure
+- When local DNS resolution fails, the hostname is cross-checked against public DNS-over-HTTPS resolvers; if it resolves publicly, the failure is likely our own network and the check is marked indeterminate
+
+**Maintenance Windows:**
+- Configure `maintenance_windows` (time-of-day ranges, optionally filtered by weekday) to pause all checks and alerting during known change windows
+- Overnight windows may wrap past midnight (e.g. `23:00` to `05:00`)
+- Alternatively, create the `maintenance_file` to pause monitoring immediately (useful before deployments or maintenance); remove it to resume
 
 **Alert Behavior:**
-- **First Failure**: When a URL transitions from OK to FAIL, a "firing" alert is sent immediately
-- **Continued Failure**: If a URL remains down, no additional alerts are sent (prevents spam)
+- **First Failure**: When a URL transitions from OK to FAIL (threshold reached), a "firing" alert is sent
+- **Continued Failure**: If a URL remains down, no additional alerts are sent until the cooldown expires (prevents spam)
 - **Recovery**: When a URL transitions from FAIL to OK, a "resolved" alert is sent automatically
 - **Subsequent Checks**: Once recovered, the URL must fail again to trigger a new "firing" alert
 
 **HTTP Redirect Handling:**
 - The monitor automatically follows HTTP redirects (301, 302, etc.)
-- The final status code after following redirects is evaluated
-- Only a final status of 200 is considered successful
+- The final status code after following redirects is evaluated against the configured `expected_status_codes`
 
 **State File Location:**
-- Default: `/tmp/url_monitor_state.json`
+- Default: `/var/lib/external-monitor/state.json`
 - Contains URL status, severity level, and timestamp of first failure
 - Automatically created and managed by the monitor
 
@@ -315,6 +348,18 @@ This ensures that:
 2. You're not spammed with repeated alerts while it's down
 3. You're notified when the service recovers
 4. Alert history survives daemon restarts
+
+### Upgrading from older versions
+
+The state file moved from `/tmp/url_monitor_state.json` to `/var/lib/external-monitor/state.json` so state survives reboots and is not cleaned up by tmpfiles. When upgrading:
+
+- With systemd, `StateDirectory=external-monitor` creates the directory automatically; for manual installs run:
+  ```bash
+  sudo mkdir -p /var/lib/external-monitor
+  sudo chown monitor:monitor /var/lib/external-monitor
+  ```
+- Copy your old state file across to preserve alert cooldowns, or start fresh (worst case: one duplicate alert for a URL that is currently failing)
+- The in-cycle retry settings (`retry_interval`) were removed; failures are now confirmed across separate check cycles instead
 
 ## Testing
 

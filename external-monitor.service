@@ -15,11 +15,14 @@ RestartSec=10
 StandardOutput=journal
 StandardError=journal
 
+# Persistent state directory (auto-created and owned by User=)
+StateDirectory=external-monitor
+
 # Security hardening
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/tmp /opt/prometheus/etc/node_exporter_textfiles
+ReadWritePaths=/tmp /opt/prometheus/etc/node_exporter_textfiles /var/lib/external-monitor
 
 # Environment
 Environment="PYTHONUNBUFFERED=1"

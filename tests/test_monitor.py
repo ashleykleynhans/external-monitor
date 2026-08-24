@@ -3,12 +3,16 @@ Unit tests for URL Monitor
 """
 
 import pytest
+import json
+import shutil
+import socket
 import tempfile
 import os
 import signal
 import time
 import requests
 import yaml
+from datetime import datetime
 from unittest.mock import Mock, patch, MagicMock, mock_open
 from monitor import (
     URLMonitor,
@@ -31,7 +35,7 @@ webhook_url: "https://discord.com/api/webhooks/test/webhook"
 urls:
   - "https://example.com"
   - "https://test.com"
-failure_threshold: 5
+failure_threshold: 2
 recovery_threshold: 2
 alert_cooldown: 0
 suppress_resolved: false
@@ -379,66 +383,6 @@ class TestDaemonFunctions:
         assert result is False
 
 
-class TestSSLCertificate:
-    """Test cases for SSL certificate checking."""
-
-    @patch('monitor.socket.create_connection')
-    def test_ssl_certificate_valid(self, mock_conn, config_file):
-        """Test valid SSL certificate."""
-        monitor = URLMonitor(config_file)
-
-        # Mock SSL connection
-        mock_socket = MagicMock()
-        mock_ssl_socket = MagicMock()
-        mock_ssl_socket.getpeercert.return_value = {"subject": "test"}
-        mock_socket.__enter__ = MagicMock(return_value=mock_ssl_socket)
-        mock_socket.__exit__ = MagicMock(return_value=False)
-        mock_conn.return_value.__enter__ = MagicMock(return_value=mock_socket)
-        mock_conn.return_value.__exit__ = MagicMock(return_value=False)
-
-        with patch('monitor.ssl.create_default_context') as mock_ssl_ctx:
-            mock_ctx = MagicMock()
-            mock_ctx.wrap_socket.return_value = mock_ssl_socket
-            mock_ssl_ctx.return_value = mock_ctx
-
-            result = monitor.check_ssl_certificate("example.com")
-            assert result is None
-
-    @patch('monitor.socket.create_connection')
-    def test_ssl_certificate_ssl_error(self, mock_conn, config_file):
-        """Test SSL certificate with SSL error."""
-        import ssl
-        monitor = URLMonitor(config_file)
-
-        mock_conn.side_effect = ssl.SSLError("Certificate verify failed")
-
-        result = monitor.check_ssl_certificate("example.com")
-        assert result is not None
-        assert "SSL Error" in result
-
-    @patch('monitor.socket.create_connection')
-    def test_ssl_certificate_timeout(self, mock_conn, config_file):
-        """Test SSL certificate check timeout."""
-        import socket
-        monitor = URLMonitor(config_file)
-
-        mock_conn.side_effect = socket.timeout("Connection timeout")
-
-        result = monitor.check_ssl_certificate("example.com")
-        assert result == "SSL check timeout"
-
-    @patch('monitor.socket.create_connection')
-    def test_ssl_certificate_generic_exception(self, mock_conn, config_file):
-        """Test SSL certificate check with generic exception."""
-        monitor = URLMonitor(config_file)
-
-        mock_conn.side_effect = Exception("Generic error")
-
-        result = monitor.check_ssl_certificate("example.com")
-        assert result is not None
-        assert "SSL check failed" in result
-
-
 class TestURLCheckExceptions:
     """Test cases for different URL check exceptions."""
 
@@ -633,15 +577,15 @@ class TestMonitorOnce:
         mock_notify.assert_not_called()
         mock_save.assert_called_once()
 
-    @patch('monitor.time.sleep')  # Mock sleep to avoid delays
     @patch('monitor.URLMonitor.check_url')
     @patch('monitor.URLMonitor.send_discord_notification')
     @patch('monitor.URLMonitor._save_state')
-    def test_monitor_once_with_failure(self, mock_save, mock_notify, mock_check, mock_sleep, config_file, state_file):
-        """Test monitor_once with one URL failing all retries (triggers alert)."""
+    def test_monitor_once_with_failure(self, mock_save, mock_notify, mock_check, config_file, state_file):
+        """Test that alerts only fire once failures accumulate across check cycles."""
         monitor = URLMonitor(config_file, state_file)
 
-        def check_side_effect(url):
+        def check_side_effect(cfg):
+            url = cfg["url"] if isinstance(cfg, dict) else cfg
             if "example.com" in url:
                 return {
                     "success": False,
@@ -658,18 +602,18 @@ class TestMonitorOnce:
 
         mock_check.side_effect = check_side_effect
 
+        # First failing cycle: below threshold (1/2), no alert yet
         monitor.monitor_once()
+        assert mock_notify.call_count == 0
+        assert monitor.state["https://example.com"]["consecutive_failures"] == 1
 
-        # example.com: 1 initial + 4 retries = 5 checks
-        # test.com: 1 check
-        # Total: 6 checks
-        assert mock_check.call_count == 6
-
-        # Should send alert after 5 consecutive failures
+        # Second failing cycle: threshold of 2 reached, alert fires
+        monitor.monitor_once()
         assert mock_notify.call_count == 1
-
-        # Verify alert was firing (not resolved)
         assert mock_notify.call_args[1]['status'] == 'firing'
+
+        # Exactly one attempt per URL per cycle (no in-cycle burst retries)
+        assert mock_check.call_count == 4
 
 
 class TestDaemonErrorPaths:
@@ -1108,11 +1052,10 @@ class TestStopDaemonForcedKill:
 class TestStateManagement:
     """Test cases for alert state management with thresholds."""
 
-    @patch('monitor.time.sleep')  # Mock sleep to avoid delays
     @patch('monitor.URLMonitor.check_url')
     @patch('monitor.URLMonitor.send_discord_notification')
-    def test_failure_only_alerts_after_threshold(self, mock_notify, mock_check, mock_sleep, config_file, state_file):
-        """Test that alert is only sent after FAILURE_THRESHOLD (5) consecutive failures."""
+    def test_failure_only_alerts_after_threshold(self, mock_notify, mock_check, config_file, state_file):
+        """Test that alerts fire only after FAILURE_THRESHOLD consecutive failing cycles."""
         monitor = URLMonitor(config_file, state_file)
 
         # Simulate a failure
@@ -1123,22 +1066,23 @@ class TestStateManagement:
             "ssl_error": None
         }
 
+        # First failing cycle: below threshold
         monitor.monitor_once()
+        assert mock_notify.call_count == 0
 
-        # Should have sent firing alert for both URLs after 5 retries each
+        # Second failing cycle: threshold reached, both URLs alert
+        monitor.monitor_once()
         assert mock_notify.call_count == 2
         # Check that status="firing" was used
         for call in mock_notify.call_args_list:
             assert call[1]['status'] == 'firing'
 
-    @patch('monitor.time.sleep')  # Mock sleep to avoid delays
     @patch('monitor.URLMonitor.check_url')
     @patch('monitor.URLMonitor.send_discord_notification')
-    def test_continued_failure_no_additional_alert(self, mock_notify, mock_check, mock_sleep, config_file, state_file):
+    def test_continued_failure_no_additional_alert(self, mock_notify, mock_check, config_file, state_file):
         """Test that continued failures after alert don't send additional alerts."""
         monitor = URLMonitor(config_file, state_file)
 
-        # First check - fails 5 times, triggers alert
         mock_check.return_value = {
             "success": False,
             "status_code": 500,
@@ -1146,29 +1090,30 @@ class TestStateManagement:
             "ssl_error": None
         }
 
+        # Two failing cycles reach the threshold and trigger alerts
+        monitor.monitor_once()
         monitor.monitor_once()
         assert mock_notify.call_count == 2  # Both URLs fail, both send alerts
 
-        # Second check - still failing (no additional alerts)
+        # Third failing cycle: still down (no additional alerts)
         mock_notify.reset_mock()
         monitor.monitor_once()
         assert mock_notify.call_count == 0  # No additional alerts sent
 
-    @patch('monitor.time.sleep')  # Mock sleep to avoid delays
     @patch('monitor.URLMonitor.check_url')
     @patch('monitor.URLMonitor.send_discord_notification')
-    def test_recovery_requires_threshold(self, mock_notify, mock_check, mock_sleep, config_file, state_file):
+    def test_recovery_requires_threshold(self, mock_notify, mock_check, config_file, state_file):
         """Test that recovery requires RECOVERY_THRESHOLD (2) consecutive successes."""
         monitor = URLMonitor(config_file, state_file)
 
-        # First check - fails and triggers alert
+        # Two failing cycles trigger alerts
         mock_check.return_value = {
             "success": False,
             "status_code": 500,
             "error": "Internal Server Error",
             "ssl_error": None
         }
-
+        monitor.monitor_once()
         monitor.monitor_once()
         assert mock_notify.call_count == 2  # Firing alerts
 
@@ -1191,10 +1136,9 @@ class TestStateManagement:
         for call in mock_notify.call_args_list:
             assert call[1]['status'] == 'resolved'
 
-    @patch('monitor.time.sleep')  # Mock sleep to avoid delays
     @patch('monitor.URLMonitor.check_url')
     @patch('monitor.URLMonitor.send_discord_notification')
-    def test_state_persists_between_checks(self, mock_notify, mock_check, mock_sleep, config_file, state_file):
+    def test_state_persists_between_checks(self, mock_notify, mock_check, config_file, state_file):
         """Test that state persists to file and can be reloaded."""
         # First monitor instance - create failing state
         monitor1 = URLMonitor(config_file, state_file)
@@ -1205,6 +1149,7 @@ class TestStateManagement:
             "ssl_error": None
         }
 
+        monitor1.monitor_once()
         monitor1.monitor_once()
         assert mock_notify.call_count == 2  # Firing alerts
 
@@ -1322,14 +1267,13 @@ class TestStateManagement:
         # Should not raise an exception
         monitor._save_state()
 
-    @patch('monitor.time.sleep')  # Mock sleep to avoid delays
     @patch('monitor.URLMonitor.check_url')
     @patch('monitor.URLMonitor.send_discord_notification')
-    def test_failure_with_ssl_error_sets_critical(self, mock_notify, mock_check, mock_sleep, config_file, state_file):
+    def test_failure_with_ssl_error_sets_critical(self, mock_notify, mock_check, config_file, state_file):
         """Test failure with SSL error sets critical severity."""
         monitor = URLMonitor(config_file, state_file)
 
-        # Simulate an SSL error
+        # Simulate an SSL error until the threshold is reached
         mock_check.return_value = {
             "success": False,
             "status_code": None,
@@ -1338,22 +1282,22 @@ class TestStateManagement:
         }
 
         monitor.monitor_once()
+        monitor.monitor_once()
 
-        # Should have sent firing alert after 5 failures
+        # Should have sent firing alert after 2 consecutive failing cycles
         assert mock_notify.call_count == 2
         # Check that state has critical severity
         for url in monitor.urls:
             assert monitor.state[url]["severity"] == "critical"
             assert monitor.state[url]["alerted"] is True
 
-    @patch('monitor.time.sleep')  # Mock sleep to avoid delays
     @patch('monitor.URLMonitor.check_url')
     @patch('monitor.URLMonitor.send_discord_notification')
-    def test_failure_with_4xx_error_sets_warning(self, mock_notify, mock_check, mock_sleep, config_file, state_file):
+    def test_failure_with_4xx_error_sets_warning(self, mock_notify, mock_check, config_file, state_file):
         """Test failure with 4xx error sets warning severity."""
         monitor = URLMonitor(config_file, state_file)
 
-        # Simulate a 404 error
+        # Simulate a 404 error until the threshold is reached
         mock_check.return_value = {
             "success": False,
             "status_code": 404,
@@ -1362,22 +1306,22 @@ class TestStateManagement:
         }
 
         monitor.monitor_once()
+        monitor.monitor_once()
 
-        # Should have sent firing alert after 5 failures
+        # Should have sent firing alert after 2 consecutive failing cycles
         assert mock_notify.call_count == 2
         # Check that state has warning severity
         for url in monitor.urls:
             assert monitor.state[url]["severity"] == "warning"
             assert monitor.state[url]["alerted"] is True
 
-    @patch('monitor.time.sleep')  # Mock sleep to avoid delays
     @patch('monitor.URLMonitor.check_url')
     @patch('monitor.URLMonitor.send_discord_notification')
-    def test_failure_with_3xx_error_sets_critical(self, mock_notify, mock_check, mock_sleep, config_file, state_file):
+    def test_failure_with_3xx_error_sets_critical(self, mock_notify, mock_check, config_file, state_file):
         """Test failure with 3xx error sets critical severity (default)."""
         monitor = URLMonitor(config_file, state_file)
 
-        # Simulate a 301 redirect error
+        # Simulate a 301 redirect error until the threshold is reached
         mock_check.return_value = {
             "success": False,
             "status_code": 301,
@@ -1386,8 +1330,9 @@ class TestStateManagement:
         }
 
         monitor.monitor_once()
+        monitor.monitor_once()
 
-        # Should have sent firing alert after 5 failures
+        # Should have sent firing alert after 2 consecutive failing cycles
         assert mock_notify.call_count == 2
         # Check that state has critical severity (default when not 4xx or 5xx)
         for url in monitor.urls:
@@ -1911,17 +1856,16 @@ class TestPrometheusMetrics:
                 os.chmod(tmpdir, 0o755)
                 os.chmod(textfile_path, 0o644)
 
-    @patch('monitor.time.sleep')
     @patch('monitor.URLMonitor.check_url')
     @patch('monitor.URLMonitor.send_discord_notification')
-    def test_alert_cooldown_prevents_rapid_alerts(self, mock_notify, mock_check, mock_sleep, state_file):
+    def test_alert_cooldown_prevents_rapid_alerts(self, mock_notify, mock_check, state_file):
         """Test that alert cooldown prevents re-alerting during the cooldown period."""
-        # Create config with short cooldown for testing
+        # Create config with short thresholds and a cooldown for testing
         config_content = """
 webhook_url: "https://discord.com/api/webhooks/test/webhook"
 urls:
   - "https://example.com"
-failure_threshold: 5
+failure_threshold: 2
 recovery_threshold: 2
 alert_cooldown: 300
 suppress_resolved: false
@@ -1933,13 +1877,15 @@ suppress_resolved: false
         try:
             monitor = URLMonitor(config_path, state_file)
 
-            # First failure - should send alert
+            # Two failing cycles reach the threshold - should send alert
             mock_check.return_value = {
                 "success": False,
                 "status_code": 500,
                 "error": "Internal Server Error",
                 "ssl_error": None
             }
+            monitor.monitor_once()
+            assert mock_notify.call_count == 0  # First failing cycle: below threshold
             monitor.monitor_once()
             assert mock_notify.call_count == 1
 
@@ -1964,15 +1910,15 @@ suppress_resolved: false
                 "ssl_error": None
             }
             monitor.monitor_once()
+            monitor.monitor_once()
             assert mock_notify.call_count == 0  # No alert due to cooldown
 
         finally:
             os.unlink(config_path)
 
-    @patch('monitor.time.sleep')
     @patch('monitor.URLMonitor.check_url')
     @patch('monitor.URLMonitor.send_discord_notification')
-    def test_alert_cooldown_allows_after_period(self, mock_notify, mock_check, mock_sleep, state_file):
+    def test_alert_cooldown_allows_after_period(self, mock_notify, mock_check, state_file):
         """Test that alerts are sent after cooldown period expires."""
         from datetime import datetime, timedelta
 
@@ -1980,7 +1926,7 @@ suppress_resolved: false
 webhook_url: "https://discord.com/api/webhooks/test/webhook"
 urls:
   - "https://example.com"
-failure_threshold: 5
+failure_threshold: 2
 recovery_threshold: 2
 alert_cooldown: 300
 suppress_resolved: false
@@ -2002,7 +1948,7 @@ suppress_resolved: false
             }
             monitor._save_state()
 
-            # Fail - should send alert (cooldown expired)
+            # Fail until the threshold is reached - alert should send (cooldown expired)
             mock_check.return_value = {
                 "success": False,
                 "status_code": 500,
@@ -2010,21 +1956,22 @@ suppress_resolved: false
                 "ssl_error": None
             }
             monitor.monitor_once()
+            assert mock_notify.call_count == 0  # Below threshold
+            monitor.monitor_once()
             assert mock_notify.call_count == 1  # Alert sent after cooldown
 
         finally:
             os.unlink(config_path)
 
-    @patch('monitor.time.sleep')
     @patch('monitor.URLMonitor.check_url')
     @patch('monitor.URLMonitor.send_discord_notification')
-    def test_suppress_resolved_alerts(self, mock_notify, mock_check, mock_sleep, state_file):
+    def test_suppress_resolved_alerts(self, mock_notify, mock_check, state_file):
         """Test that suppress_resolved prevents sending resolved alerts."""
         config_content = """
 webhook_url: "https://discord.com/api/webhooks/test/webhook"
 urls:
   - "https://example.com"
-failure_threshold: 5
+failure_threshold: 2
 recovery_threshold: 2
 alert_cooldown: 0
 suppress_resolved: true
@@ -2036,13 +1983,15 @@ suppress_resolved: true
         try:
             monitor = URLMonitor(config_path, state_file)
 
-            # Failure - should send alert
+            # Two failing cycles - should send alert
             mock_check.return_value = {
                 "success": False,
                 "status_code": 500,
                 "error": "Internal Server Error",
                 "ssl_error": None
             }
+            monitor.monitor_once()
+            assert mock_notify.call_count == 0  # Below threshold
             monitor.monitor_once()
             assert mock_notify.call_count == 1
             assert mock_notify.call_args[1]['status'] == 'firing'
@@ -2075,10 +2024,13 @@ urls:
 
         try:
             monitor = URLMonitor(config_path)
-            assert monitor.failure_threshold == 10
-            assert monitor.recovery_threshold == 5
+            assert monitor.failure_threshold == 3
+            assert monitor.recovery_threshold == 2
             assert monitor.alert_cooldown == 1800
             assert monitor.suppress_resolved is False
+            assert monitor.dns_verification is True
+            assert monitor.maintenance_windows == []
+            assert monitor.maintenance_file is None
 
         finally:
             os.unlink(config_path)
@@ -2161,3 +2113,540 @@ urls:
                 assert any("Disk quota exceeded" in record.message for record in caplog.records)
                 # Check that the permission advice was NOT logged (covers line 345->exit)
                 assert not any("Please ensure" in record.message and "writable" in record.message for record in caplog.records)
+
+
+def write_config_file(content):
+    """Write YAML config content to a temporary file and return its path."""
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.yml', delete=False) as f:
+        f.write(content)
+        return f.name
+
+
+BASE_CONFIG = """
+webhook_url: "https://discord.com/api/webhooks/test/webhook"
+urls:
+  - "https://example.com"
+failure_threshold: 2
+recovery_threshold: 2
+alert_cooldown: 0
+suppress_resolved: false
+"""
+
+
+class TestPerURLConfig:
+    """Tests for per-URL configuration entries (headers, codes, timeouts)."""
+
+    def test_normalize_entry_string_defaults(self, config_file):
+        monitor = URLMonitor(config_file)
+        entry = monitor._normalize_entry("https://example.com")
+
+        assert entry == {
+            "url": "https://example.com",
+            "expected_status_codes": [200],
+            "headers": {},
+            "timeout": None,
+        }
+
+    def test_normalize_entry_full_dict(self, config_file):
+        monitor = URLMonitor(config_file)
+        entry = monitor._normalize_entry({
+            "url": "https://example.com/health",
+            "expected_status_codes": [200, 204],
+            "headers": {"Authorization": "Bearer token"},
+            "timeout": 15,
+        })
+
+        assert entry["url"] == "https://example.com/health"
+        assert entry["expected_status_codes"] == [200, 204]
+        assert entry["headers"] == {"Authorization": "Bearer token"}
+        assert entry["timeout"] == 15.0
+
+    def test_normalize_entry_single_code_normalized(self, config_file):
+        monitor = URLMonitor(config_file)
+        entry = monitor._normalize_entry({"url": "https://x.test", "expected_status_codes": 204})
+        assert entry["expected_status_codes"] == [204]
+
+    def test_normalize_entry_missing_url_raises(self, config_file):
+        monitor = URLMonitor(config_file)
+        with pytest.raises(ValueError):
+            monitor._normalize_entry({"headers": {"X": "y"}})
+
+    def test_normalize_entry_invalid_type_raises(self, config_file):
+        monitor = URLMonitor(config_file)
+        with pytest.raises(ValueError):
+            monitor._normalize_entry(["not-a-url"])
+
+    def test_url_configs_normalized_at_init(self):
+        config_content = BASE_CONFIG + (
+            "urls:\n"
+            "  - \"https://example.com\"\n"
+            "  - url: \"https://api.test/status\"\n"
+            "    expected_status_codes: [200, 204]\n"
+            "    headers:\n"
+            '      Authorization: "Bearer abc"\n'
+            "    timeout: 10\n"
+        )
+        config_path = write_config_file(config_content)
+
+        try:
+            monitor = URLMonitor(config_path)
+            assert len(monitor.url_configs) == 2
+            assert monitor.url_configs[1]["expected_status_codes"] == [200, 204]
+            assert monitor.url_configs[1]["timeout"] == 10.0
+        finally:
+            os.unlink(config_path)
+
+    @patch('monitor.requests.get')
+    def test_expected_status_codes_accepted(self, mock_get, config_file):
+        monitor = URLMonitor(config_file)
+        response = Mock()
+        response.status_code = 204
+        response.headers = {}
+        mock_get.return_value = response
+
+        result = monitor.check_url({
+            "url": "https://example.com/status",
+            "expected_status_codes": [200, 204],
+            "headers": {},
+            "timeout": None,
+        })
+
+        assert result["success"] is True
+        assert result["status_code"] == 204
+        assert result["indeterminate"] is False
+
+    @patch('monitor.requests.get')
+    def test_default_only_200_accepted(self, mock_get, config_file):
+        monitor = URLMonitor(config_file)
+        response = Mock()
+        response.status_code = 204
+        response.headers = {}
+        mock_get.return_value = response
+
+        result = monitor.check_url("https://example.com")
+
+        assert result["success"] is False
+        assert result["error_class"] == "http"
+
+    @patch('monitor.requests.get')
+    def test_custom_headers_sent_per_url(self, mock_get, config_file):
+        monitor = URLMonitor(config_file)
+        response = Mock()
+        response.status_code = 200
+        response.headers = {}
+        mock_get.return_value = response
+
+        monitor.check_url({
+            "url": "https://example.com",
+            "expected_status_codes": [200],
+            "headers": {"Authorization": "Bearer token123"},
+            "timeout": None,
+        })
+
+        headers = mock_get.call_args[1]["headers"]
+        assert headers["Authorization"] == "Bearer token123"
+        assert "External Monitoring Tool" in headers["User-Agent"]
+
+    @patch('monitor.requests.get')
+    def test_per_url_timeout_override(self, mock_get, config_file):
+        monitor = URLMonitor(config_file)
+        response = Mock()
+        response.status_code = 200
+        response.headers = {}
+        mock_get.return_value = response
+
+        monitor.check_url({
+            "url": "https://example.com/slow",
+            "expected_status_codes": [200],
+            "headers": {},
+            "timeout": 7,
+        })
+        assert mock_get.call_args[1]["timeout"] == 7.0
+
+        mock_get.reset_mock()
+        monitor.check_url("https://example.com")
+        assert mock_get.call_args[1]["timeout"] == 30
+
+
+class TestRateLimitHandling:
+    """Tests for HTTP 429 / Retry-After handling."""
+
+    @patch('monitor.requests.get')
+    def test_429_is_indeterminate_with_retry_after(self, mock_get, config_file):
+        """Rate limiting is neither up nor down and reports Retry-After."""
+        monitor = URLMonitor(config_file)
+        response = Mock()
+        response.status_code = 429
+        response.headers = {"Retry-After": "30"}
+        mock_get.return_value = response
+
+        result = monitor.check_url("https://example.com")
+
+        assert result["success"] is False
+        assert result["indeterminate"] is True
+        assert result["error_class"] == "rate_limited"
+        assert result["retry_after"] == "30"
+        assert "429" in result["error"]
+
+    @patch('monitor.requests.get')
+    def test_retry_after_captured_on_other_statuses(self, mock_get, config_file):
+        monitor = URLMonitor(config_file)
+        response = Mock()
+        response.status_code = 503
+        response.headers = {"Retry-After": "120"}
+        mock_get.return_value = response
+
+        result = monitor.check_url("https://example.com")
+
+        assert result["success"] is False
+        assert result["indeterminate"] is False
+        assert result["error_class"] == "http"
+        assert result["retry_after"] == "120"
+
+
+class TestDNSVerification:
+    """Tests for DNS failure classification and public resolver cross-checks."""
+
+    def test_is_dns_error_reason_gaierror(self):
+        exc = OSError("name resolution failed")
+        exc.reason = socket.gaierror()
+        assert URLMonitor._is_dns_error(exc) is True
+
+    def test_is_dns_error_message_marker(self):
+        exc = requests.exceptions.ConnectionError(
+            "[Errno 8] nodename nor servname known for 'example.com'"
+        )
+        assert URLMonitor._is_dns_error(exc) is True
+
+    def test_is_dns_error_negative(self):
+        exc = requests.exceptions.ConnectionError("[Errno 111] Connection refused")
+        assert URLMonitor._is_dns_error(exc) is False
+
+    @patch('monitor.requests.get')
+    def test_verify_dns_globally_confirms(self, mock_get, config_file):
+        monitor = URLMonitor(config_file)
+        response = Mock()
+        response.status_code = 200
+        response.json.return_value = {"Status": 0, "Answer": [{"data": "93.184.216.34"}]}
+        mock_get.return_value = response
+
+        assert monitor._verify_dns_globally("example.com") is True
+
+    @patch('monitor.requests.get')
+    def test_verify_dns_globally_skips_non_200_and_confirms_on_next(self, mock_get, config_file):
+        monitor = URLMonitor(config_file)
+        failing = Mock()
+        failing.status_code = 500
+        confirming = Mock()
+        confirming.status_code = 200
+        confirming.json.return_value = {"Status": 0, "Answer": [{"data": "1.2.3.4"}]}
+        mock_get.side_effect = [failing, confirming]
+
+        assert monitor._verify_dns_globally("example.com") is True
+
+    @patch('monitor.requests.get')
+    def test_verify_dns_globally_denies_nxdomain(self, mock_get, config_file):
+        monitor = URLMonitor(config_file)
+        response = Mock()
+        response.status_code = 200
+        response.json.return_value = {"Status": 3}
+        mock_get.return_value = response
+
+        assert monitor._verify_dns_globally("example.com") is False
+
+    @patch('monitor.requests.get')
+    def test_verify_dns_globally_unreachable_returns_none(self, mock_get, config_file):
+        monitor = URLMonitor(config_file)
+        mock_get.side_effect = requests.exceptions.ConnectionError("network down")
+
+        assert monitor._verify_dns_globally("example.com") is None
+
+    @patch('monitor.URLMonitor._verify_dns_globally', return_value=True)
+    @patch('monitor.requests.get')
+    def test_dns_error_contradicted_by_resolvers_is_indeterminate(self, mock_get, mock_verify, config_file):
+        monitor = URLMonitor(config_file)
+        mock_get.side_effect = requests.exceptions.ConnectionError(
+            "[Errno 8] nodename nor servname known for 'example.com'"
+        )
+
+        result = monitor.check_url("https://example.com")
+
+        mock_verify.assert_called_once_with("example.com")
+        assert result["success"] is False
+        assert result["error_class"] == "dns"
+        assert result["indeterminate"] is True
+
+    @patch('monitor.URLMonitor._verify_dns_globally', return_value=False)
+    @patch('monitor.requests.get')
+    def test_dns_error_confirmed_missing_counts_as_failure(self, mock_get, mock_verify, config_file):
+        monitor = URLMonitor(config_file)
+        mock_get.side_effect = requests.exceptions.ConnectionError(
+            "[Errno 8] nodename nor servname known for 'example.com'"
+        )
+
+        result = monitor.check_url("https://example.com")
+
+        assert result["error_class"] == "dns"
+        assert result["indeterminate"] is False
+
+    @patch('monitor.URLMonitor._verify_dns_globally')
+    @patch('monitor.requests.get')
+    def test_dns_verification_disabled(self, mock_get, mock_verify):
+        config_content = BASE_CONFIG.replace(
+            "suppress_resolved: false",
+            "suppress_resolved: false\ndns_verification: false"
+        )
+        config_path = write_config_file(config_content)
+
+        try:
+            monitor = URLMonitor(config_path)
+            assert monitor.dns_verification is False
+            mock_get.side_effect = requests.exceptions.ConnectionError(
+                "[Errno 8] nodename nor servname known for 'example.com'"
+            )
+
+            result = monitor.check_url("https://example.com")
+
+            mock_verify.assert_not_called()
+            assert result["error_class"] == "dns"
+            assert result["indeterminate"] is False
+        finally:
+            os.unlink(config_path)
+
+
+class TestIndeterminateResults:
+    """Tests for how indeterminate check results affect alerting state."""
+
+    INDETERMINATE_RESULT = {
+        "url": "https://example.com",
+        "success": False,
+        "status_code": 429,
+        "error": "HTTP 429 (rate limited)",
+        "ssl_error": None,
+        "error_class": "rate_limited",
+        "indeterminate": True,
+        "retry_after": "30",
+    }
+
+    @patch('monitor.URLMonitor.check_url')
+    @patch('monitor.URLMonitor.send_discord_notification')
+    @patch('monitor.URLMonitor._save_state')
+    def test_indeterminate_never_counts_or_alerts(self, mock_save, mock_notify, mock_check, state_file):
+        config_content = BASE_CONFIG.replace("failure_threshold: 2", "failure_threshold: 1")
+        config_path = write_config_file(config_content)
+
+        try:
+            monitor = URLMonitor(config_path, state_file)
+            mock_check.return_value = dict(self.INDETERMINATE_RESULT)
+
+            for _ in range(3):
+                monitor.monitor_once()
+
+            assert mock_notify.call_count == 0
+            url_state = monitor.state["https://example.com"]
+            assert url_state["consecutive_failures"] == 0
+            assert url_state["consecutive_successes"] == 0
+            assert url_state["alerted"] is False
+        finally:
+            os.unlink(config_path)
+
+    @patch('monitor.URLMonitor.check_url')
+    @patch('monitor.URLMonitor.send_discord_notification')
+    @patch('monitor.URLMonitor._save_state')
+    def test_indeterminate_preserves_existing_counters(self, mock_save, mock_notify, mock_check, state_file):
+        config_path = write_config_file(BASE_CONFIG)
+
+        try:
+            monitor = URLMonitor(config_path, state_file)
+            monitor.state["https://example.com"] = {
+                "consecutive_failures": 1,
+                "consecutive_successes": 0,
+                "alerted": False,
+                "severity": "critical",
+                "first_failure": "2026-08-21T12:00:00",
+                "last_alert_time": None,
+            }
+            mock_check.return_value = dict(self.INDETERMINATE_RESULT)
+
+            monitor.monitor_once()
+
+            assert monitor.state["https://example.com"]["consecutive_failures"] == 1
+            assert mock_notify.call_count == 0
+        finally:
+            os.unlink(config_path)
+
+
+class TestMaintenanceWindows:
+    """Tests for maintenance window parsing and sentinel-file pausing."""
+
+    MAINTENANCE_CONFIG = BASE_CONFIG + (
+        "maintenance_windows:\n"
+        "  - start: \"02:00\"\n"
+        "    end: \"04:00\"\n"
+        "  - start: \"23:00\"\n"
+        "    end: \"05:00\"\n"
+        "    days: [\"sun\"]\n"
+    )
+
+    def test_parse_window_days_variants(self, config_file):
+        monitor = URLMonitor(config_file)
+
+        assert monitor._parse_window_days(None) is None
+        assert monitor._parse_window_days([0, 6]) == {0, 6}
+        assert monitor._parse_window_days(["sat", "sun"]) == {5, 6}
+
+        with pytest.raises(ValueError):
+            monitor._parse_window_days([7])
+        with pytest.raises(ValueError):
+            monitor._parse_window_days(["funday"])
+
+    def test_parse_maintenance_windows_valid(self):
+        config_content = self.MAINTENANCE_CONFIG.replace("maintenance_windows:", "maintenance_windows:", 1)
+        config_path = write_config_file(config_content)
+
+        try:
+            # Constructor logs the configured windows (init coverage)
+            monitor = URLMonitor(config_path)
+            parsed = monitor.maintenance_windows
+
+            assert parsed[0]["start"] == 120 and parsed[0]["end"] == 240
+            assert parsed[0]["days"] is None
+            assert parsed[1]["start"] == 23 * 60 and parsed[1]["end"] == 300
+            assert parsed[1]["days"] == {6}
+        finally:
+            os.unlink(config_path)
+
+    def test_parse_maintenance_windows_missing_field_raises(self):
+        config_content = BASE_CONFIG + (
+            "maintenance_windows:\n"
+            "  - end: \"04:00\"\n"
+        )
+        config_path = write_config_file(config_content)
+
+        try:
+            with pytest.raises(ValueError, match="Invalid maintenance window"):
+                URLMonitor(config_path)
+        finally:
+            os.unlink(config_path)
+
+    def test_parse_maintenance_windows_bad_day_raises(self):
+        config_content = BASE_CONFIG + (
+            "maintenance_windows:\n"
+            "  - start: \"02:00\"\n"
+            "    end: \"04:00\"\n"
+            "    days: [\"funday\"]\n"
+        )
+        config_path = write_config_file(config_content)
+
+        try:
+            with pytest.raises(ValueError, match="Invalid maintenance window"):
+                URLMonitor(config_path)
+        finally:
+            os.unlink(config_path)
+
+    def test_in_maintenance_sentinel_file(self):
+        sentinel_dir = tempfile.mkdtemp()
+        sentinel = os.path.join(sentinel_dir, 'maintenance-active')
+        open(sentinel, 'w').close()
+
+        config_content = BASE_CONFIG.replace(
+            "suppress_resolved: false",
+            f"suppress_resolved: false\nmaintenance_file: \"{sentinel}\""
+        )
+        config_path = write_config_file(config_content)
+
+        try:
+            # Constructor logs the sentinel path (init coverage)
+            monitor = URLMonitor(config_path)
+            assert monitor._in_maintenance() is True
+        finally:
+            os.unlink(config_path)
+            os.remove(sentinel)
+            os.rmdir(sentinel_dir)
+
+    def test_in_maintenance_normal_and_overnight_windows(self):
+        config_path = write_config_file(self.MAINTENANCE_CONFIG)
+
+        try:
+            monitor = URLMonitor(config_path)
+            friday = datetime(2026, 8, 21)   # weekday 4
+            sunday = datetime(2026, 8, 23)   # weekday 6
+
+            # Daily window 02:00-04:00 matches any day inside the range
+            assert monitor._in_maintenance(datetime(2026, 8, 21, 3, 0)) is True
+            assert monitor._in_maintenance(datetime(2026, 8, 21, 5, 0)) is False
+
+            # Overnight window 23:00-05:00 wraps midnight but only on Sundays
+            assert monitor._in_maintenance(sunday.replace(hour=1, minute=30)) is True
+            assert monitor._in_maintenance(friday.replace(hour=1, minute=30)) is False
+            assert monitor._in_maintenance(sunday.replace(hour=12, minute=0)) is False
+        finally:
+            os.unlink(config_path)
+
+    @patch('monitor.URLMonitor.check_url')
+    @patch('monitor.URLMonitor.send_discord_notification')
+    @patch('monitor.URLMonitor._save_state')
+    def test_monitor_once_skips_checks_while_paused_then_resumes(self, mock_save, mock_notify, mock_check):
+        sentinel_dir = tempfile.mkdtemp()
+        sentinel = os.path.join(sentinel_dir, 'maintenance-active')
+        open(sentinel, 'w').close()
+
+        config_content = BASE_CONFIG.replace(
+            "suppress_resolved: false",
+            f"suppress_resolved: false\nmaintenance_file: \"{sentinel}\""
+        )
+        config_path = write_config_file(config_content)
+
+        try:
+            monitor = URLMonitor(config_path)
+
+            monitor.monitor_once()
+            assert mock_check.call_count == 0
+            assert monitor._maintenance_active is True
+
+            # A second cycle while still paused must stay quiet
+            monitor.monitor_once()
+            assert mock_check.call_count == 0
+
+            os.remove(sentinel)
+            monitor.monitor_once()
+            assert mock_check.call_count == len(monitor.url_configs)
+            assert monitor._maintenance_active is False
+        finally:
+            os.unlink(config_path)
+            shutil.rmtree(sentinel_dir, ignore_errors=True)
+
+
+class TestStatePersistenceEdgeCases:
+    """Edge cases around saving monitor state."""
+
+    def test_save_state_without_parent_directory(self, config_file):
+        """A bare relative filename has no parent dir and must still save."""
+        workdir = tempfile.mkdtemp()
+        original_cwd = os.getcwd()
+        os.chdir(workdir)
+
+        try:
+            monitor = URLMonitor(config_file, state_file="state.json")
+            monitor.state["https://example.com"] = {"consecutive_failures": 0}
+            monitor._save_state()
+
+            assert os.path.exists("state.json")
+        finally:
+            os.chdir(original_cwd)
+            shutil.rmtree(workdir, ignore_errors=True)
+
+    def test_save_state_creates_missing_directories(self, config_file):
+        base_dir = tempfile.mkdtemp()
+        nested_state = os.path.join(base_dir, "var", "lib", "external-monitor", "state.json")
+
+        try:
+            monitor = URLMonitor(config_file, state_file=nested_state)
+            monitor.state["https://example.com"] = {"consecutive_failures": 1}
+            monitor._save_state()
+
+            assert os.path.exists(nested_state)
+            with open(nested_state) as f:
+                assert json.load(f)["https://example.com"]["consecutive_failures"] == 1
+        finally:
+            shutil.rmtree(base_dir, ignore_errors=True)

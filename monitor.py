@@ -2,7 +2,8 @@
 """
 URL Monitoring Script
 Monitors configured URLs for availability and SSL certificate validity.
-Sends notifications to Discord via webhook on failures.
+Sends notifications to Alertmanager via webhook on failures, with optional
+PagerDuty backup.
 
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
@@ -20,7 +21,6 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 import time
 import socket
-import ssl
 import requests
 import yaml
 import logging
@@ -46,15 +46,21 @@ logger = logging.getLogger(__name__)
 # Default configuration values
 DEFAULT_CHECK_INTERVAL = 120  # Check interval in seconds (2 minutes)
 DEFAULT_TIMEOUT = 30  # Request timeout
-DEFAULT_FAILURE_THRESHOLD = 10  # Number of consecutive failures before alerting (increased from 5)
-DEFAULT_RECOVERY_THRESHOLD = 5  # Number of consecutive successes before resolving (increased from 2)
-DEFAULT_RETRY_INTERVAL = 5  # Initial seconds between retries for failed checks
-DEFAULT_MAX_RETRY_INTERVAL = 60  # Maximum seconds between retries (exponential backoff cap)
+DEFAULT_FAILURE_THRESHOLD = 3  # Consecutive failing check cycles before alerting
+DEFAULT_RECOVERY_THRESHOLD = 2  # Consecutive successful check cycles before resolving
 DEFAULT_ALERT_COOLDOWN = 1800  # Cooldown period in seconds before re-alerting (30 minutes)
 DEFAULT_SUPPRESS_RESOLVED = False  # Whether to suppress resolved alerts during flapping
+DEFAULT_DNS_VERIFICATION = True  # Cross-check DNS failures against public resolvers
+DEFAULT_DNS_RESOLVERS = [
+    "https://1.1.1.1/dns-query",  # IP-based so it works even when local DNS is broken
+    "https://dns.google/resolve"
+]
 DEFAULT_PID_FILE = "/tmp/url_monitor.pid"
 DEFAULT_LOG_FILE = "/tmp/url_monitor.log"
-DEFAULT_STATE_FILE = "/tmp/url_monitor_state.json"
+DEFAULT_STATE_FILE = "/var/lib/external-monitor/state.json"
+
+# Weekday names accepted in maintenance window day lists
+DAY_NAMES = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
 
 # Global flag for graceful shutdown
 shutdown_requested = False
@@ -223,14 +229,22 @@ class URLMonitor:
         self.timeout = self.config.get("timeout", DEFAULT_TIMEOUT)
         self.failure_threshold = self.config.get("failure_threshold", DEFAULT_FAILURE_THRESHOLD)
         self.recovery_threshold = self.config.get("recovery_threshold", DEFAULT_RECOVERY_THRESHOLD)
-        self.retry_interval = self.config.get("retry_interval", DEFAULT_RETRY_INTERVAL)
-        self.max_retry_interval = self.config.get("max_retry_interval", DEFAULT_MAX_RETRY_INTERVAL)
         self.alert_cooldown = self.config.get("alert_cooldown", DEFAULT_ALERT_COOLDOWN)
         self.suppress_resolved = self.config.get("suppress_resolved", DEFAULT_SUPPRESS_RESOLVED)
+
+        # False positive reduction settings
+        self.dns_verification = self.config.get("dns_verification", DEFAULT_DNS_VERIFICATION)
+        self.dns_resolvers = self.config.get("dns_resolvers", DEFAULT_DNS_RESOLVERS)
+        self.maintenance_windows = self._parse_maintenance_windows(self.config.get("maintenance_windows", []))
+        self.maintenance_file = self.config.get("maintenance_file")
+        self._maintenance_active = False
 
         # Use state_file parameter if provided, otherwise use config, otherwise use default
         self.state_file = state_file if state_file is not None else self.config.get("state_file", DEFAULT_STATE_FILE)
         self.state = self._load_state()
+
+        # Normalize URLs so each entry carries its own check settings
+        self.url_configs = [self._normalize_entry(entry) for entry in self.urls]
 
         # Prometheus textfile configuration
         self.prometheus_textfile_dir = self.config.get("prometheus_textfile_dir")
@@ -243,8 +257,16 @@ class URLMonitor:
         logger.info(f"Initialized monitor on host: {self.hostname}")
         logger.info(f"Monitoring {len(self.urls)} URL(s)")
         logger.info(f"Check interval: {self.check_interval}s, Timeout: {self.timeout}s")
-        logger.info(f"Thresholds - Failure: {self.failure_threshold}, Recovery: {self.recovery_threshold}")
+        logger.info(
+            f"Thresholds - Failure: {self.failure_threshold} consecutive cycles, "
+            f"Recovery: {self.recovery_threshold} consecutive cycles"
+        )
         logger.info(f"Alert cooldown: {self.alert_cooldown}s, Suppress resolved alerts: {self.suppress_resolved}")
+        logger.info(f"DNS verification for failed resolutions: {'enabled' if self.dns_verification else 'disabled'}")
+        if self.maintenance_windows:
+            logger.info(f"Maintenance windows configured: {len(self.maintenance_windows)}")
+        if self.maintenance_file:
+            logger.info(f"Maintenance sentinel file: {self.maintenance_file}")
         if self.pagerduty_key:
             logger.info("PagerDuty backup notifications enabled")
         if self.prometheus_textfile_dir:
@@ -261,6 +283,87 @@ class URLMonitor:
         except yaml.YAMLError as e:
             logger.error(f"Error parsing config file: {e}")
             raise
+
+    def _normalize_entry(self, entry) -> Dict:
+        """
+        Normalize a URL config entry (plain string or mapping) into a dict
+        carrying per-URL check settings.
+        """
+        if isinstance(entry, str):
+            return {
+                "url": entry,
+                "expected_status_codes": [200],
+                "headers": {},
+                "timeout": None,
+            }
+        if isinstance(entry, dict):
+            url = entry.get("url")
+            if not url:
+                raise ValueError(f"URL entry is missing the 'url' key: {entry}")
+            codes = entry.get("expected_status_codes", [200])
+            if isinstance(codes, int):
+                codes = [codes]
+            timeout = entry.get("timeout")
+            return {
+                "url": url,
+                "expected_status_codes": list(codes),
+                "headers": dict(entry.get("headers", {})),
+                "timeout": float(timeout) if timeout else None,
+            }
+        raise ValueError(f"Invalid URL entry (must be a string or mapping): {entry}")
+
+    @staticmethod
+    def _parse_window_days(days) -> Optional[set]:
+        """Parse day specifiers (ints 0-6 or names like 'mon') into weekday ints."""
+        if days is None:
+            return None
+        parsed = set()
+        for day in days:
+            if isinstance(day, int):
+                if not 0 <= day <= 6:
+                    raise ValueError(f"Day index out of range (0-6): {day}")
+                parsed.add(day)
+            else:
+                name = str(day).strip().lower()[:3]
+                if name not in DAY_NAMES:
+                    raise ValueError(f"Unknown day name: {day}")
+                parsed.add(DAY_NAMES[name])
+        return parsed
+
+    def _parse_maintenance_windows(self, windows: List[Dict]) -> List[Dict]:
+        """Parse and validate maintenance window definitions from config."""
+        parsed = []
+        for i, window in enumerate(windows):
+            try:
+                start_h, start_m = str(window["start"]).split(":")
+                end_h, end_m = str(window["end"]).split(":")
+                days = self._parse_window_days(window.get("days"))
+                parsed.append({
+                    "start": int(start_h) * 60 + int(start_m),
+                    "end": int(end_h) * 60 + int(end_m),
+                    "days": days
+                })
+            except (KeyError, ValueError, AttributeError) as e:
+                raise ValueError(f"Invalid maintenance window #{i + 1} ({window}): {e}")
+        return parsed
+
+    def _in_maintenance(self, now: datetime = None) -> bool:
+        """Check whether monitoring is paused by the sentinel file or a window."""
+        if self.maintenance_file and os.path.exists(self.maintenance_file):
+            return True
+
+        now = now or datetime.now()
+        current_minutes = now.hour * 60 + now.minute
+        for window in self.maintenance_windows:
+            if window["days"] is not None and now.weekday() not in window["days"]:
+                continue
+            if window["start"] <= window["end"]:
+                if window["start"] <= current_minutes < window["end"]:
+                    return True
+            elif current_minutes >= window["start"] or current_minutes < window["end"]:
+                # Overnight window (e.g. 23:00-04:00) wraps past midnight
+                return True
+        return False
 
     def _load_state(self) -> Dict:
         """Load state from JSON file."""
@@ -280,6 +383,9 @@ class URLMonitor:
     def _save_state(self):
         """Save state to JSON file."""
         try:
+            parent_dir = os.path.dirname(self.state_file)
+            if parent_dir:
+                os.makedirs(parent_dir, exist_ok=True)
             with open(self.state_file, 'w') as f:
                 json.dump(self.state, f, indent=2)
         except Exception as e:
@@ -345,38 +451,75 @@ class URLMonitor:
             if "Permission denied" in str(e) or "Read-only file system" in str(e):
                 logger.error(f"Please ensure {self.prometheus_textfile_dir} is writable by this process")
 
-    def check_ssl_certificate(self, hostname: str, port: int = 443) -> Optional[str]:
-        """
-        Check SSL certificate validity.
-        Returns error message if invalid, None if valid.
-        """
-        try:
-            context = ssl.create_default_context()
-            with socket.create_connection((hostname, port), timeout=self.timeout) as sock:
-                with context.wrap_socket(sock, server_hostname=hostname) as ssock:
-                    cert = ssock.getpeercert()
-                    # Certificate is valid if we get here
-                    return None
-        except ssl.SSLError as e:
-            return f"SSL Error: {str(e)}"
-        except socket.timeout:
-            return "SSL check timeout"
-        except Exception as e:
-            return f"SSL check failed: {str(e)}"
+    @staticmethod
+    def _is_dns_error(exception: Exception) -> bool:
+        """Detect whether an exception was caused by a DNS resolution failure."""
+        reason = getattr(exception, "reason", None)
+        if isinstance(reason, socket.gaierror):
+            return True
+        markers = (
+            "getaddrinfo",
+            "name or service not known",
+            "nodename nor servname",
+            "temporary failure in name resolution",
+            "no address associated with hostname",
+        )
+        message = str(reason or exception).lower()
+        return any(marker in message for marker in markers)
 
-    def check_url(self, url: str) -> Dict:
+    def _verify_dns_globally(self, hostname: str) -> Optional[bool]:
         """
-        Check a URL for availability and SSL validity.
+        Cross-check DNS resolution against public resolvers (DNS over HTTPS).
+
+        Returns True if any resolver confirms the hostname resolves,
+        False if at least one reachable resolver says it does not exist,
+        None if no resolver could be reached.
+        """
+        resolver_reachable = False
+        for resolver in self.dns_resolvers:
+            try:
+                response = requests.get(
+                    resolver,
+                    params={"name": hostname, "type": "A"},
+                    headers={"accept": "application/dns-json"},
+                    timeout=10
+                )
+                if response.status_code != 200:
+                    continue
+                data = response.json()
+                if data.get("Status") == 0 and data.get("Answer"):
+                    return True
+                # Resolver answered but reported no records for the name
+                resolver_reachable = True
+            except Exception as e:
+                logger.debug(f"DNS verification via {resolver} failed: {e}")
+        return False if resolver_reachable else None
+
+    def check_url(self, url_config) -> Dict:
+        """
+        Check a URL for availability.
+        Accepts either a plain URL string or a normalized config entry dict.
         Follows redirects automatically and reports the final status code.
         SSL validation is performed by requests library for all URLs in redirect chain.
+
+        Results are classified so that conditions which are ambiguous
+        (rate limiting, DNS failures contradicted by public resolvers) are
+        marked "indeterminate" instead of counting as failures.
+
         Returns a dict with status and error information.
         """
+        cfg = self._normalize_entry(url_config)
+        url = cfg["url"]
+
         result = {
             "url": url,
             "success": True,
             "status_code": None,
             "error": None,
-            "ssl_error": None
+            "ssl_error": None,
+            "error_class": None,
+            "indeterminate": False,
+            "retry_after": None
         }
 
         # Check HTTP response (SSL validation handled by requests library)
@@ -384,28 +527,89 @@ class URLMonitor:
             headers = {
                 'User-Agent': 'External Monitoring Tool; ExternalMonitor/v0.0.1; +https://github.com/ashleykleynhans/external-monitor'
             }
-            response = requests.get(url, timeout=self.timeout, verify=True, allow_redirects=True, headers=headers)
+            headers.update(cfg["headers"])
+            response = requests.get(
+                url,
+                timeout=cfg["timeout"] or self.timeout,
+                verify=True,
+                allow_redirects=True,
+                headers=headers
+            )
             result["status_code"] = response.status_code
 
-            if response.status_code != 200:
+            retry_after = response.headers.get("Retry-After")
+            if isinstance(retry_after, str) and retry_after:
+                result["retry_after"] = retry_after
+
+            if response.status_code == 429:
+                # Rate limited by the target: neither up nor down. Counting it
+                # as failure would page on our own monitoring frequency.
                 result["success"] = False
+                result["indeterminate"] = True
+                result["error_class"] = "rate_limited"
+                retry_after = ", Retry-After: " + str(result["retry_after"]) if result["retry_after"] else ""
+                result["error"] = f"HTTP 429 (rate limited{retry_after})"
+            elif response.status_code not in cfg["expected_status_codes"]:
+                result["success"] = False
+                result["error_class"] = "http"
                 result["error"] = f"HTTP {response.status_code}"
 
         except requests.exceptions.SSLError as e:
             result["success"] = False
             result["ssl_error"] = f"SSL Error: {str(e)}"
             result["error"] = f"SSL connection error: {str(e)}"
+            result["error_class"] = "ssl"
         except requests.exceptions.ConnectionError as e:
             result["success"] = False
             result["error"] = f"Connection error: {str(e)}"
+            if self._is_dns_error(e):
+                result["error_class"] = "dns"
+                # A local resolution failure often means OUR network is broken,
+                # not the target. Cross-check against public resolvers before
+                # letting it count toward an alert.
+                if self.dns_verification:
+                    hostname = urlparse(url).hostname
+                    confirmed = self._verify_dns_globally(hostname)
+                    if confirmed:
+                        logger.warning(
+                            f"DNS for {hostname} resolves via public resolvers but failed locally; "
+                            "marking check indeterminate (likely local network issue)"
+                        )
+                        result["indeterminate"] = True
+            else:
+                result["error_class"] = "connection"
         except requests.exceptions.Timeout:
             result["success"] = False
             result["error"] = "Request timeout"
+            result["error_class"] = "timeout"
         except Exception as e:
             result["success"] = False
             result["error"] = f"Unexpected error: {str(e)}"
+            result["error_class"] = "unexpected"
 
         return result
+
+    @staticmethod
+    def _classify_severity(error_details: Dict) -> str:
+        """Map an error to an alert severity (critical for 5xx/SSL, warning for 4xx)."""
+        if error_details.get("ssl_error"):
+            return "critical"
+        status_code = error_details.get("status_code")
+        if status_code and status_code >= 500:
+            return "critical"
+        if status_code and status_code >= 400:
+            return "warning"
+        return "critical"
+
+    @staticmethod
+    def _build_description(error_details: Dict) -> str:
+        """Build a combined description from error details."""
+        parts = []
+        if error_details.get("error"):
+            parts.append(error_details["error"])
+        if error_details.get("ssl_error"):
+            parts.append(f"SSL: {error_details['ssl_error']}")
+        return " | ".join(parts) if parts else "URL is unreachable"
 
     def send_pagerduty_alert(self, url: str, error_details: Dict, severity: str, status: str = "firing"):
         """Send alert to PagerDuty Events API v2 as backup."""
@@ -415,13 +619,7 @@ class URLMonitor:
 
         pagerduty_url = "https://events.pagerduty.com/v2/enqueue"
 
-        # Build description
-        description_parts = []
-        if error_details.get("error"):
-            description_parts.append(error_details['error'])
-        if error_details.get("ssl_error"):
-            description_parts.append(f"SSL: {error_details['ssl_error']}")
-        description = " | ".join(description_parts) if description_parts else "URL is unreachable"
+        description = self._build_description(error_details)
 
         # Determine event action based on status
         event_action = "resolve" if status == "resolved" else "trigger"
@@ -489,22 +687,10 @@ class URLMonitor:
             }
         else:
             # Build alert description for firing alerts
-            description_parts = []
-            if error_details.get("error"):
-                description_parts.append(error_details['error'])
-            if error_details.get("ssl_error"):
-                description_parts.append(f"SSL: {error_details['ssl_error']}")
-
-            description = " | ".join(description_parts) if description_parts else "URL is unreachable"
+            description = self._build_description(error_details)
 
             # Determine severity based on error type
-            severity = "critical"
-            if error_details.get("ssl_error"):
-                severity = "critical"
-            elif error_details.get("status_code") and error_details["status_code"] >= 500:
-                severity = "critical"
-            elif error_details.get("status_code") and error_details["status_code"] >= 400:
-                severity = "warning"
+            severity = self._classify_severity(error_details)
 
             # Build Alertmanager-compatible payload
             alert = {
@@ -563,10 +749,27 @@ class URLMonitor:
                 self.send_pagerduty_alert(url, error_details, severity, status)
 
     def monitor_once(self):
-        """Perform one monitoring check of all URLs with retry logic and thresholds."""
+        """
+        Perform one monitoring check of all URLs.
+
+        Each check cycle makes exactly one attempt per URL. Failures are
+        confirmed across separate cycles (consecutive_failures counts failing
+        cycles, not retries), so brief transient blips cannot trigger alerts.
+        """
+        if self._in_maintenance():
+            if not self._maintenance_active:
+                logger.info("Maintenance active, skipping monitoring checks")
+                self._maintenance_active = True
+            return
+
+        if self._maintenance_active:
+            logger.info("Maintenance ended, resuming monitoring checks")
+            self._maintenance_active = False
+
         logger.info("Starting monitoring check...")
 
-        for url in self.urls:
+        for cfg in self.url_configs:
+            url = cfg["url"]
             # Get previous state
             previous_state = self.state.get(url, {})
             consecutive_failures = previous_state.get("consecutive_failures", 0)
@@ -574,19 +777,26 @@ class URLMonitor:
             is_alerted = previous_state.get("alerted", False)
             last_alert_time = previous_state.get("last_alert_time")
 
-            # Perform initial check
-            result = self.check_url(url)
-            retry_count = 1  # Track number of attempts made
+            # Single attempt per URL per cycle: failures are confirmed across
+            # cycles rather than with rapid in-cycle retries.
+            result = self.check_url(cfg)
 
-            # If initial check fails, retry up to failure_threshold times with exponential backoff
-            if not result["success"]:
-                while retry_count < self.failure_threshold and not result["success"]:
-                    # Exponential backoff: delay doubles each retry, capped at max_retry_interval
-                    backoff_delay = min(self.retry_interval * (2 ** (retry_count - 1)), self.max_retry_interval)
-                    logger.info(f"Retry {retry_count}/{self.failure_threshold-1} for {url} in {backoff_delay}s...")
-                    time.sleep(backoff_delay)
-                    result = self.check_url(url)
-                    retry_count += 1
+            if result.get("indeterminate"):
+                logger.warning(
+                    f"INDETERMINATE: {url} - {result.get('error', 'Unknown error')}; "
+                    "not counting toward failure or success thresholds"
+                )
+                # Preserve counters unchanged so ambiguous conditions (rate
+                # limiting, suspected local network issues) cannot page anyone
+                self.state[url] = {
+                    "consecutive_failures": previous_state.get("consecutive_failures", 0),
+                    "consecutive_successes": previous_state.get("consecutive_successes", 0),
+                    "alerted": is_alerted,
+                    "severity": previous_state.get("severity", "critical"),
+                    "first_failure": previous_state.get("first_failure"),
+                    "last_alert_time": last_alert_time
+                }
+                continue
 
             if result["success"]:
                 logger.info(f"OK: {url} (HTTP {result['status_code']})")
@@ -630,27 +840,18 @@ class URLMonitor:
             else:
                 logger.warning(f"FAIL: {url} - {result.get('error', 'Unknown error')}")
 
-                # Reset success counter
+                # Reset success counter, count this failing cycle
                 consecutive_successes = 0
+                consecutive_failures += 1
 
-                # After retry loop, all failure_threshold attempts failed
-                consecutive_failures = self.failure_threshold
+                severity = self._classify_severity(result)
 
-                # Determine severity for state tracking
-                severity = "critical"
-                if result.get("ssl_error"):
-                    severity = "critical"
-                elif result.get("status_code") and result["status_code"] >= 500:
-                    severity = "critical"
-                elif result.get("status_code") and result["status_code"] >= 400:
-                    severity = "warning"
-
-                # Check if we should send alert (not already alerted OR cooldown period has passed)
+                # Alert once the failure threshold of consecutive cycles is reached,
+                # provided we are not already alerted and the cooldown has elapsed
                 should_alert = False
                 current_time = datetime.now()
 
-                if not is_alerted:
-                    # Check if we're still in cooldown from a previous alert
+                if consecutive_failures >= self.failure_threshold and not is_alerted:
                     if last_alert_time:
                         last_alert_dt = datetime.fromisoformat(last_alert_time.replace('Z', '+00:00'))
                         time_since_alert = (current_time - last_alert_dt).total_seconds()
@@ -664,9 +865,13 @@ class URLMonitor:
                     else:
                         # No previous alert, send immediately
                         should_alert = True
+                elif consecutive_failures < self.failure_threshold:
+                    logger.info(
+                        f"{consecutive_failures}/{self.failure_threshold} failing checks toward alert threshold: {url}"
+                    )
 
                 if should_alert:
-                    logger.warning(f"URL failed {consecutive_failures} consecutive times, sending alert: {url}")
+                    logger.warning(f"URL failed {consecutive_failures} consecutive check cycles, sending alert: {url}")
                     self.send_discord_notification(url, result, status="firing")
                     self.state[url] = {
                         "consecutive_failures": consecutive_failures,
@@ -677,7 +882,7 @@ class URLMonitor:
                         "last_alert_time": current_time.isoformat()
                     }
                 else:
-                    # Already alerted or in cooldown, just track failures
+                    # Below threshold, already alerted, or in cooldown; track state
                     if is_alerted:
                         logger.debug(f"URL still failing (already alerted): {url}")
                     self.state[url] = {

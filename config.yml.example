@@ -1,31 +1,60 @@
 # Alertmanager webhook URL
-webhook_url: "https://discord.com/api/webhooks/your/webhook/url"
+webhook_url: "https://your-alertmanager.com/api/v1/alerts"
 
 # PagerDuty Integration Key (optional - used as backup if Alertmanager is unavailable)
 # Get this from your PagerDuty service's Integrations tab (Events API v2)
 pagerduty_integration_key: ""
 
-# List of URLs to monitor
+# URLs to monitor. Each entry is either a plain URL string, or a mapping with
+# per-URL settings:
+#   url:                   (required) the URL to check
+#   expected_status_codes: HTTP status codes treated as healthy (default: [200])
+#   headers:               extra HTTP headers, e.g. to get past a WAF or
+#                          authenticate (merged with the default User-Agent)
+#   timeout:               per-URL timeout in seconds (default: global timeout)
 urls:
   - "https://example.com"
   - "https://www.google.com"
-  - "https://api.github.com"
+  - url: "https://api.github.com/status"
+    expected_status_codes: [200, 204]
+    # headers:
+    #   Authorization: "Bearer your-token-here"
+    # timeout: 10
 
 # Monitoring configuration (optional - defaults shown below)
-# check_interval: 120  # Check interval in seconds (2 minutes)
-# timeout: 30  # Request timeout in seconds
-# failure_threshold: 10  # Number of consecutive failures before alerting
-# recovery_threshold: 5  # Number of consecutive successes before resolving
-# retry_interval: 5  # Seconds between retries for failed checks
+# check_interval: 120       # Check interval in seconds (2 minutes)
+# timeout: 30               # Request timeout in seconds
+# failure_threshold: 3      # Consecutive failing check cycles before alerting.
+#                           # Each cycle is one attempt; there are no rapid
+#                           # in-cycle retries, so brief blips never page.
+# recovery_threshold: 2     # Consecutive successful cycles before resolving
+
+# False positive reduction (optional - defaults shown below)
+# dns_verification: true    # When local DNS resolution fails, cross-check the
+#                           # hostname against public resolvers before counting
+#                           # it as a failure (a mismatch means OUR network is
+#                           # broken, so the check is marked indeterminate)
+# dns_resolvers:            # DNS-over-HTTPS endpoints used for verification
+#   - "https://1.1.1.1/dns-query"
+#   - "https://dns.google/resolve"
+#
+# Maintenance windows pause all checks and alerting entirely:
+# maintenance_windows:
+#   - start: "02:00"        # Daily window, HH:MM local time
+#     end: "04:00"
+#   - start: "23:00"        # Overnight windows may wrap past midnight
+#     end: "05:00"
+#     days: ["sat", "sun"]  # Optional day filter (names or ints 0=Mon..6=Sun)
+# maintenance_file: "/tmp/url_monitor_maintenance"  # Monitoring pauses while this file exists
 
 # Alert spam reduction settings (optional - defaults shown below)
-# alert_cooldown: 1800  # Cooldown period in seconds before re-alerting (30 minutes)
+# alert_cooldown: 1800      # Cooldown period in seconds before re-alerting (30 minutes)
 # suppress_resolved: false  # Set to true to suppress resolved alerts during flapping
 
 # Daemon configuration (optional - defaults shown below)
 # pid_file: "/tmp/url_monitor.pid"
 # log_file: "/tmp/url_monitor.log"
-# state_file: "/tmp/url_monitor_state.json"
+# state_file: "/var/lib/external-monitor/state.json"  # Persistent across reboots (not /tmp)
 
 # Prometheus textfile exporter configuration (optional)
 # prometheus_textfile_dir: "/opt/prometheus/etc/node_exporter_textfiles"  # Directory for Prometheus textfile collector
